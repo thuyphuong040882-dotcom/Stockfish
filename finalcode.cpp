@@ -25,7 +25,8 @@ void readUntil(HANDLE hRead, const char* keyword) {
 std::string getBestMove(
     HANDLE hIn,
     HANDLE hOut,
-    const std::vector<std::string>& moves
+    const std::vector<std::string>& moves,
+    int movetime
 ) {
     DWORD written;
     char buffer[256];
@@ -36,7 +37,8 @@ std::string getBestMove(
     cmd += "\n";
     WriteFile(hIn, cmd.c_str(), (DWORD)cmd.size(), &written, NULL);
 
-    WriteFile(hIn, "go movetime 1000\n", 17, &written, NULL);
+    std::string goCmd = "go movetime " + std::to_string(movetime) + "\n";
+    WriteFile(hIn, goCmd.c_str(), (DWORD)goCmd.size(), &written, NULL);
 
     std::string output;
     while (ReadFile(hOut, buffer, sizeof(buffer) - 1, &read, NULL)) {
@@ -121,6 +123,41 @@ int main() {
     std::cout << "Dinh dang nuoc di: e2e4 (hoac e7e8q khi phong cap)\n";
     std::cout << "Nhap 'thoat' de ket thuc\n\n";
 
+    // Chọn độ khó
+    int skillLevel = 20;
+    int movetime   = 1000;
+
+    std::cout << "Chon do kho:\n";
+    std::cout << "  1. De    (Skill 3,  suy nghi 200ms)\n";
+    std::cout << "  2. TB    (Skill 10, suy nghi 500ms)\n";
+    std::cout << "  3. Kho   (Skill 18, suy nghi 1000ms)\n";
+    std::cout << "  4. Chuyen gia (Skill 20, suy nghi 2000ms)\n";
+
+    int diffChoice = 0;
+    while (diffChoice < 1 || diffChoice > 4) {
+        std::cout << "Lua chon (1-4): ";
+        std::cin >> diffChoice;
+        if (diffChoice < 1 || diffChoice > 4)
+            std::cout << "Vui long nhap so tu 1 den 4!\n";
+    }
+
+    switch (diffChoice) {
+        case 1: skillLevel = 3;  movetime = 200;  break;
+        case 2: skillLevel = 10; movetime = 500;  break;
+        case 3: skillLevel = 18; movetime = 1000; break;
+        case 4: skillLevel = 20; movetime = 2000; break;
+    }
+
+    // Gửi skill level cho Stockfish
+    {
+        DWORD w;
+        std::string skillCmd = "setoption name Skill Level value " + std::to_string(skillLevel) + "\n";
+        WriteFile(inWrite, skillCmd.c_str(), (DWORD)skillCmd.size(), &w, NULL);
+    }
+
+    const char* diffNames[] = { "", "De", "Trung binh", "Kho", "Chuyen gia" };
+    std::cout << "Do kho: " << diffNames[diffChoice] << "\n";
+
     // Chọn màu quân
     char colorChoice = 0;
     while (colorChoice != 'T' && colorChoice != 'D') {
@@ -138,7 +175,7 @@ int main() {
     // Nếu người chơi là quân đen, Stockfish đi trước
     if (!playerIsWhite) {
         std::cout << "\nStockfish dang suy nghi...\n";
-        std::string best = getBestMove(inWrite, outRead, moves);
+        std::string best = getBestMove(inWrite, outRead, moves, movetime);
         if (best.empty() || best == "(none)") {
             std::cout << "Loi: Stockfish khong tra ve nuoc di.\n";
         } else {
@@ -175,7 +212,7 @@ int main() {
         moves.push_back(userMove);
 
         std::cout << "Stockfish dang suy nghi...\n";
-        std::string best = getBestMove(inWrite, outRead, moves);
+        std::string best = getBestMove(inWrite, outRead, moves, movetime);
         if (best.empty() || best == "(none)") {
             std::cout << "Stockfish khong tim duoc nuoc di. Ban da thang!\n";
             break;
