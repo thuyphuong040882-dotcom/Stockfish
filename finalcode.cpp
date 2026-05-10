@@ -119,7 +119,33 @@ int main() {
 
     std::cout << "===== CO VUA VS STOCKFISH =====\n";
     std::cout << "Dinh dang nuoc di: e2e4 (hoac e7e8q khi phong cap)\n";
-    std::cout << "Nhap 'thoat' de ket thuc\n";
+    std::cout << "Nhap 'thoat' de ket thuc\n\n";
+
+    // Chọn màu quân
+    char colorChoice = 0;
+    while (colorChoice != 'T' && colorChoice != 'D') {
+        std::cout << "Chon quan cua ban ([T]rang / [D]en): ";
+        std::string input;
+        std::cin >> input;
+        colorChoice = (char)toupper(input[0]);
+        if (colorChoice != 'T' && colorChoice != 'D')
+            std::cout << "Vui long nhap T (trang) hoac D (den)!\n";
+    }
+
+    bool playerIsWhite = (colorChoice == 'T');
+    std::cout << "Ban choi quan " << (playerIsWhite ? "TRANG (di truoc)" : "DEN (di sau)") << "\n";
+
+    // Nếu người chơi là quân đen, Stockfish đi trước
+    if (!playerIsWhite) {
+        std::cout << "\nStockfish dang suy nghi...\n";
+        std::string best = getBestMove(inWrite, outRead, moves);
+        if (best.empty() || best == "(none)") {
+            std::cout << "Loi: Stockfish khong tra ve nuoc di.\n";
+        } else {
+            std::cout << "Stockfish (Trang): " << best << "\n";
+            moves.push_back(best);
+        }
+    }
 
     // Vòng lặp game
     while (true) {
@@ -136,7 +162,7 @@ int main() {
         }
 
         std::string userMove;
-        std::cout << "Nguoi choi: ";
+        std::cout << "Nguoi choi (" << (playerIsWhite ? "Trang" : "Den") << "): ";
         std::cin >> userMove;
 
         if (userMove == "thoat") break;
@@ -148,13 +174,14 @@ int main() {
 
         moves.push_back(userMove);
 
+        std::cout << "Stockfish dang suy nghi...\n";
         std::string best = getBestMove(inWrite, outRead, moves);
         if (best.empty() || best == "(none)") {
-            std::cout << "Stockfish khong tim duoc nuoc di. Co the ban da thang!\n";
+            std::cout << "Stockfish khong tim duoc nuoc di. Ban da thang!\n";
             break;
         }
 
-        std::cout << "Stockfish: " << best << "\n";
+        std::cout << "Stockfish (" << (playerIsWhite ? "Den" : "Trang") << "): " << best << "\n";
         moves.push_back(best);
         turnNumber++;
     }
