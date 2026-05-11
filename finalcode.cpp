@@ -1,316 +1,466 @@
 #include <windows.h>
-#include <iostream>
+#include <windowsx.h>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <cstring>
 #include <cctype>
-#include <io.h>
-#include <fcntl.h>
 
-const char* STOCKFISH_PATH = "C:\\Users\\Huyen\\Downloads\\stockfish\\stockfish\\stockfish.exe";
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
 
-// ===================== BOARD STATE =====================
-char board[8][8];
+// ===================== CONSTANTS =====================
+static const int SQ    = 80;
+static const int OX    = 50;
+static const int OY    = 30;
+static const int WIN_W = SQ*8 + OX + 20;
+static const int WIN_H = SQ*8 + OY + 30 + 60;
+#define WM_SF_DONE (WM_APP+1)
 
-void initBoard() {
-    const char* back = "rnbqkbnr";
-    for (int c = 0; c < 8; c++) {
-        board[0][c] = back[c];
-        board[1][c] = 'p';
-        for (int r = 2; r < 6; r++) board[r][c] = '.';
-        board[6][c] = 'P';
-        board[7][c] = (char)toupper(back[c]);
-    }
+static const char* SF_PATH = "C:\\Users\\Huyen\\Downloads\\stockfish\\stockfish\\stockfish.exe";
+
+static const COLORREF C_LIGHT = RGB(240,217,181);
+static const COLORREF C_DARK  = RGB(181,136, 99);
+static const COLORREF C_SEL   = RGB(247,247,105);
+static const COLORREF C_LEGAL = RGB( 80,150, 80);
+static const COLORREF C_LAST  = RGB(205,210, 98);
+static const COLORREF C_CHECK = RGB(220, 50, 50);
+static const COLORREF C_BG    = RGB( 40, 40, 40);
+
+// ===================== TYPES =====================
+struct Move { int fr,fc,tr,tc; char promo; bool ep,castle; };
+
+// ===================== STATE =====================
+static struct {
+    char  board[8][8];
+    bool  playerWhite, playerTurn;
+    bool  wKM,bKM,wARM,wHRM,bARM,bHRM;
+    int   epR,epC;
+    std::vector<std::string> uciMoves;
+    int   selR,selC;
+    std::vector<Move> legal;
+    int   lastFR,lastFC,lastTR,lastTC;
+    bool  inCheck,gameOver,sfBusy;
+    std::string status;
+    HANDLE sfIn,sfOut,sfProc,sfThr;
+    int   skillLv,movetime;
+} G;
+
+static HWND  hWnd;
+static HFONT hPF, hSF;
+
+// ===================== HELPERS =====================
+inline bool isW(char p)  { return p>='A'&&p<='Z'; }
+inline bool isB(char p)  { return p>='a'&&p<='z'; }
+inline bool inBnd(int r,int c) { return r>=0&&r<8&&c>=0&&c<8; }
+inline bool isEnemy(char p,bool w) { return w?isB(p):isW(p); }
+inline bool isFriend(char p,bool w){ return w?isW(p):isB(p); }
+
+// ===================== CHESS LOGIC =====================
+static bool attacked(char b[8][8], int r, int c, bool byW) {
+    char K=byW?'K':'k', Q=byW?'Q':'q', R=byW?'R':'r',
+         B2=byW?'B':'b', N=byW?'N':'n', P=byW?'P':'p';
+
+    static const int kd[8][2]={{-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1}};
+    for (auto& d:kd) { int nr=r+d[0],nc=c+d[1]; if(inBnd(nr,nc)&&b[nr][nc]==N) return true; }
+
+    if (byW) { if(inBnd(r+1,c-1)&&b[r+1][c-1]==P) return true; if(inBnd(r+1,c+1)&&b[r+1][c+1]==P) return true; }
+    else     { if(inBnd(r-1,c-1)&&b[r-1][c-1]==P) return true; if(inBnd(r-1,c+1)&&b[r-1][c+1]==P) return true; }
+
+    static const int sd[4][2]={{0,1},{0,-1},{1,0},{-1,0}};
+    for (auto& d:sd) for (int i=1;i<8;i++) { int nr=r+d[0]*i,nc=c+d[1]*i; if(!inBnd(nr,nc)) break; if(b[nr][nc]!='.'){if(b[nr][nc]==R||b[nr][nc]==Q)return true;break;} }
+
+    static const int dd[4][2]={{1,1},{1,-1},{-1,1},{-1,-1}};
+    for (auto& d:dd) for (int i=1;i<8;i++) { int nr=r+d[0]*i,nc=c+d[1]*i; if(!inBnd(nr,nc)) break; if(b[nr][nc]!='.'){if(b[nr][nc]==B2||b[nr][nc]==Q)return true;break;} }
+
+    for (int dr=-1;dr<=1;dr++) for (int dc=-1;dc<=1;dc++)
+        if ((dr||dc)&&inBnd(r+dr,c+dc)&&b[r+dr][c+dc]==K) return true;
+    return false;
 }
 
-void applyMove(const std::string& mv) {
-    if (mv.size() < 4) return;
-    int fc = mv[0]-'a', fr = 8-(mv[1]-'0');
-    int tc = mv[2]-'a', tr = 8-(mv[3]-'0');
-    char piece = board[fr][fc];
-    board[fr][fc] = '.';
-    board[tr][tc] = piece;
-    if (mv.size() == 5) {
-        char p = mv[4];
-        board[tr][tc] = isupper(piece) ? (char)toupper(p) : p;
-    }
-    // Nhập thành
-    if ((piece=='K'||piece=='k') && abs(tc-fc)==2) {
-        if (tc==6) { board[tr][5]=board[tr][7]; board[tr][7]='.'; }
-        else       { board[tr][3]=board[tr][0]; board[tr][0]='.'; }
-    }
+static void findKing(char b[8][8], bool w, int& kr, int& kc) {
+    char K=w?'K':'k';
+    for (int r=0;r<8;r++) for (int c=0;c<8;c++) if (b[r][c]==K) { kr=r; kc=c; return; }
+    kr=kc=-1;
 }
 
-// ===================== CONSOLE DISPLAY =====================
-const wchar_t* pieceChar(char p) {
-    switch(p) {
-        case 'K': return L"♔"; case 'Q': return L"♕"; case 'R': return L"♖";
-        case 'B': return L"♗"; case 'N': return L"♘"; case 'P': return L"♙";
-        case 'k': return L"♚"; case 'q': return L"♛"; case 'r': return L"♜";
-        case 'b': return L"♝"; case 'n': return L"♞"; case 'p': return L"♟";
-        default:  return L" ";
+static void doMove(char b[8][8], const Move& m, int& epR, int& epC) {
+    epR=epC=-1;
+    char p=b[m.fr][m.fc];
+    b[m.fr][m.fc]='.';
+    b[m.tr][m.tc]=m.promo?(isW(p)?(char)toupper(m.promo):m.promo):p;
+    if (m.ep) b[isW(p)?m.tr+1:m.tr-1][m.tc]='.';
+    if (m.castle) {
+        if (m.tc==6) { b[m.tr][5]=b[m.tr][7]; b[m.tr][7]='.'; }
+        else         { b[m.tr][3]=b[m.tr][0]; b[m.tr][0]='.'; }
     }
+    if ((char)toupper(p)=='P'&&abs(m.tr-m.fr)==2) { epR=(m.fr+m.tr)/2; epC=m.fc; }
 }
 
-void gotoXY(HANDLE h, int x, int y) {
-    COORD pos = {(SHORT)x, (SHORT)y};
-    SetConsoleCursorPosition(h, pos);
-}
+static std::vector<Move> pseudo(char b[8][8], int fr, int fc, int epR, int epC) {
+    std::vector<Move> mv;
+    char p=b[fr][fc]; if (p=='.') return mv;
+    bool w=isW(p); char u=(char)toupper(p);
 
-// fromR/fromC = -1 nghĩa là không highlight
-void drawBoard(HANDLE h, int sx, int sy, int fromR=-1, int fromC=-1, int toR=-1, int toC=-1) {
-    const WORD LIGHT   = BACKGROUND_RED|BACKGROUND_GREEN|BACKGROUND_BLUE|BACKGROUND_INTENSITY;
-    const WORD DARK    = BACKGROUND_BLUE|BACKGROUND_GREEN;
-    const WORD HL_FROM = BACKGROUND_RED|BACKGROUND_GREEN|BACKGROUND_INTENSITY; // vàng
-    const WORD HL_TO   = BACKGROUND_GREEN|BACKGROUND_INTENSITY;                // xanh lá
-    const WORD RESET   = FOREGROUND_RED|FOREGROUND_GREEN|FOREGROUND_BLUE|FOREGROUND_INTENSITY;
+    auto add=[&](int tr,int tc,char pr=0,bool ep=false,bool cas=false){
+        if (!inBnd(tr,tc)) return;
+        if (!ep&&!cas&&isFriend(b[tr][tc],w)) return;
+        mv.push_back({fr,fc,tr,tc,pr,ep,cas});
+    };
 
-    for (int r = 0; r < 8; r++) {
-        gotoXY(h, sx, sy+r);
-        SetConsoleTextAttribute(h, RESET);
-        wprintf(L"%d ", 8-r);
-
-        for (int c = 0; c < 8; c++) {
-            bool light = (r+c)%2==0;
-            WORD bg = (r==fromR && c==fromC) ? HL_FROM :
-                      (r==toR   && c==toC  ) ? HL_TO   :
-                      light ? LIGHT : DARK;
-
-            char piece = board[r][c];
-            WORD fg = (isupper(piece) && piece!='.') ?
-                       FOREGROUND_INTENSITY :
-                      (FOREGROUND_RED|FOREGROUND_BLUE|FOREGROUND_INTENSITY);
-
-            SetConsoleTextAttribute(h, bg|fg);
-            wprintf(L" %s ", pieceChar(piece));
+    if (u=='P') {
+        int dir=w?-1:1, sR=w?6:1, pR=w?0:7;
+        if (inBnd(fr+dir,fc)&&b[fr+dir][fc]=='.') {
+            if (fr+dir==pR) add(fr+dir,fc,'q');
+            else { add(fr+dir,fc); if (fr==sR&&b[fr+2*dir][fc]=='.') add(fr+2*dir,fc); }
         }
-        SetConsoleTextAttribute(h, RESET);
-        wprintf(L" \n");
+        for (int dc:{-1,1}) {
+            int tr2=fr+dir, tc2=fc+dc; if (!inBnd(tr2,tc2)) continue;
+            if (isEnemy(b[tr2][tc2],w)) { if(tr2==pR) add(tr2,tc2,'q'); else add(tr2,tc2); }
+            else if (tr2==epR&&tc2==epC) add(tr2,tc2,0,true);
+        }
     }
-    gotoXY(h, sx+2, sy+8);
-    SetConsoleTextAttribute(h, RESET);
-    wprintf(L"  a  b  c  d  e  f  g  h\n");
-    SetConsoleTextAttribute(h, FOREGROUND_RED|FOREGROUND_GREEN|FOREGROUND_BLUE);
+    if (u=='N') { static const int kd[8][2]={{-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1}}; for (auto& d:kd) add(fr+d[0],fc+d[1]); }
+    auto slide=[&](int dr,int dc){ for(int i=1;i<8;i++){int r=fr+dr*i,c=fc+dc*i;if(!inBnd(r,c))break;add(r,c);if(b[r][c]!='.')break;} };
+    if (u=='B'||u=='Q') { slide(1,1);slide(1,-1);slide(-1,1);slide(-1,-1); }
+    if (u=='R'||u=='Q') { slide(0,1);slide(0,-1);slide(1,0);slide(-1,0); }
+    if (u=='K') { for(int dr=-1;dr<=1;dr++) for(int dc=-1;dc<=1;dc++) if(dr||dc) add(fr+dr,fc+dc); }
+    return mv;
 }
 
-// Animation 3 frame: highlight nguồn → highlight nguồn+đích → áp dụng và vẽ lại
-void animateMove(HANDLE h, int sx, int sy, const std::string& mv) {
-    if (mv.size() < 4) return;
-    int fr = 8-(mv[1]-'0'), fc = mv[0]-'a';
-    int tr = 8-(mv[3]-'0'), tc = mv[2]-'a';
+static std::vector<Move> getLegal(int fr, int fc) {
+    std::vector<Move> legal;
+    char p=G.board[fr][fc]; if (p=='.') return legal;
+    bool w=isW(p);
+    for (auto& m:pseudo(G.board,fr,fc,G.epR,G.epC)) {
+        char b2[8][8]; memcpy(b2,G.board,64);
+        int er,ec; doMove(b2,m,er,ec);
+        int kr,kc; findKing(b2,w,kr,kc);
+        if (kr>=0&&!attacked(b2,kr,kc,!w)) legal.push_back(m);
+    }
+    // Castling
+    if ((char)toupper(p)=='K') {
+        int kRow=w?7:0;
+        bool km=w?G.wKM:G.bKM;
+        if (!km&&fr==kRow&&fc==4&&!attacked(G.board,kRow,4,!w)) {
+            bool hrm=w?G.wHRM:G.bHRM;
+            if (!hrm&&G.board[kRow][5]=='.'&&G.board[kRow][6]=='.'
+                &&!attacked(G.board,kRow,5,!w)&&!attacked(G.board,kRow,6,!w))
+                legal.push_back({fr,fc,kRow,6,0,false,true});
+            bool arm=w?G.wARM:G.bARM;
+            if (!arm&&G.board[kRow][3]=='.'&&G.board[kRow][2]=='.'&&G.board[kRow][1]=='.'
+                &&!attacked(G.board,kRow,3,!w)&&!attacked(G.board,kRow,2,!w))
+                legal.push_back({fr,fc,kRow,2,0,false,true});
+        }
+    }
+    return legal;
+}
 
-    drawBoard(h, sx, sy, fr, fc, -1, -1);  // ô nguồn sáng vàng
-    Sleep(350);
-    drawBoard(h, sx, sy, fr, fc, tr, tc);  // cả nguồn + đích
-    Sleep(350);
-    applyMove(mv);
-    drawBoard(h, sx, sy, -1, -1, tr, tc);  // quân đã di chuyển, đích sáng xanh
-    Sleep(300);
-    drawBoard(h, sx, sy);                   // bàn cờ bình thường
+static bool anyLegal(bool w) {
+    for (int r=0;r<8;r++) for (int c=0;c<8;c++)
+        if (w?isW(G.board[r][c]):isB(G.board[r][c]))
+            if (!getLegal(r,c).empty()) return true;
+    return false;
+}
+
+static std::string toUCI(const Move& m) {
+    std::string s;
+    s+=(char)('a'+m.fc); s+=(char)('0'+(8-m.fr));
+    s+=(char)('a'+m.tc); s+=(char)('0'+(8-m.tr));
+    if (m.promo) s+=m.promo;
+    return s;
+}
+
+static void applyMove(const Move& m) {
+    char p=G.board[m.fr][m.fc];
+    if (p=='K') G.wKM=true; if (p=='k') G.bKM=true;
+    if (m.fr==7&&m.fc==0) G.wARM=true; if (m.fr==7&&m.fc==7) G.wHRM=true;
+    if (m.fr==0&&m.fc==0) G.bARM=true; if (m.fr==0&&m.fc==7) G.bHRM=true;
+    doMove(G.board,m,G.epR,G.epC);
+    G.lastFR=m.fr; G.lastFC=m.fc; G.lastTR=m.tr; G.lastTC=m.tc;
+    G.uciMoves.push_back(toUCI(m));
+}
+
+static void applyUCI(const std::string& mv) {
+    if (mv.size()<4) return;
+    int fc=mv[0]-'a', fr=8-(mv[1]-'0'), tc=mv[2]-'a', tr=8-(mv[3]-'0');
+    char pr=mv.size()==5?mv[4]:0;
+    char p=G.board[fr][fc];
+    bool ep=((char)toupper(p)=='P'&&fc!=tc&&G.board[tr][tc]=='.');
+    bool cas=((char)toupper(p)=='K'&&abs(tc-fc)==2);
+    applyMove({fr,fc,tr,tc,pr,ep,cas});
 }
 
 // ===================== STOCKFISH =====================
-void readUntil(HANDLE hRead, const char* kw) {
-    char buf[256]; DWORD r;
-    std::string out;
-    while (ReadFile(hRead, buf, sizeof(buf)-1, &r, NULL)) {
-        buf[r]='\0'; out+=buf;
-        if (out.find(kw)!=std::string::npos) break;
-    }
+static void sfRead(const char* kw) {
+    char buf[512]; DWORD r; std::string out;
+    while (ReadFile(G.sfOut,buf,sizeof(buf)-1,&r,NULL)) { buf[r]='\0'; out+=buf; if (out.find(kw)!=std::string::npos) break; }
 }
 
-std::string getBestMove(HANDLE hIn, HANDLE hOut,
-                        const std::vector<std::string>& moves, int movetime) {
+static DWORD WINAPI sfWorker(LPVOID) {
     DWORD w;
-    std::string cmd = "position startpos moves";
-    for (auto& m : moves) cmd += " "+m;
-    cmd += "\n";
-    WriteFile(hIn, cmd.c_str(), (DWORD)cmd.size(), &w, NULL);
-
-    std::string go = "go movetime "+std::to_string(movetime)+"\n";
-    WriteFile(hIn, go.c_str(), (DWORD)go.size(), &w, NULL);
-
-    char buf[256]; DWORD r;
-    std::string out;
-    while (ReadFile(hOut, buf, sizeof(buf)-1, &r, NULL)) {
+    std::string cmd="position startpos moves";
+    for (auto& m:G.uciMoves) cmd+=" "+m;
+    cmd+="\n";
+    WriteFile(G.sfIn,cmd.c_str(),(DWORD)cmd.size(),&w,NULL);
+    std::string go="go movetime "+std::to_string(G.movetime)+"\n";
+    WriteFile(G.sfIn,go.c_str(),(DWORD)go.size(),&w,NULL);
+    char buf[512]; DWORD r; std::string out;
+    while (ReadFile(G.sfOut,buf,sizeof(buf)-1,&r,NULL)) {
         buf[r]='\0'; out+=buf;
-        size_t p = out.find("bestmove ");
+        size_t p=out.find("bestmove ");
         if (p!=std::string::npos) {
             std::istringstream iss(out.substr(p));
-            std::string tmp, best;
-            iss>>tmp>>best;
-            return best;
+            std::string tmp,best; iss>>tmp>>best;
+            char* s=new char[best.size()+1]; strcpy(s,best.c_str());
+            PostMessage(hWnd,WM_SF_DONE,0,(LPARAM)s);
+            break;
         }
     }
-    return "";
+    return 0;
 }
 
-bool isValidMove(const std::string& mv) {
-    if (mv.size()<4||mv.size()>5) return false;
-    if (mv[0]<'a'||mv[0]>'h') return false;
-    if (mv[1]<'1'||mv[1]>'8') return false;
-    if (mv[2]<'a'||mv[2]>'h') return false;
-    if (mv[3]<'1'||mv[3]>'8') return false;
-    if (mv.size()==5) {
-        char p=mv[4];
-        if (p!='q'&&p!='r'&&p!='b'&&p!='n') return false;
+static void sfThink() {
+    if (G.sfBusy||G.gameOver) return;
+    G.sfBusy=true;
+    HANDLE h=CreateThread(NULL,0,sfWorker,NULL,0,NULL);
+    CloseHandle(h);
+}
+
+// ===================== RENDERING =====================
+static const wchar_t* glyph(char p) {
+    switch(p) {
+        case 'K':return L"♔"; case 'Q':return L"♕"; case 'R':return L"♖";
+        case 'B':return L"♗"; case 'N':return L"♘"; case 'P':return L"♙";
+        case 'k':return L"♚"; case 'q':return L"♛"; case 'r':return L"♜";
+        case 'b':return L"♝"; case 'n':return L"♞"; case 'p':return L"♟";
+        default: return L"";
     }
+}
+
+static void render(HDC hdc) {
+    int ckR=-1, ckC=-1;
+    if (G.inCheck) {
+        bool cw=G.playerTurn?G.playerWhite:!G.playerWhite;
+        findKing(G.board,cw,ckR,ckC);
+    }
+
+    for (int r=0;r<8;r++) for (int c=0;c<8;c++) {
+        bool lt=(r+c)%2==0;
+        COLORREF col=lt?C_LIGHT:C_DARK;
+        if ((r==G.lastFR&&c==G.lastFC)||(r==G.lastTR&&c==G.lastTC)) col=C_LAST;
+        if (r==G.selR&&c==G.selC) col=C_SEL;
+        if (r==ckR&&c==ckC) col=C_CHECK;
+        RECT sq={OX+c*SQ, OY+r*SQ, OX+c*SQ+SQ, OY+r*SQ+SQ};
+        HBRUSH br=CreateSolidBrush(col); FillRect(hdc,&sq,br); DeleteObject(br);
+
+        for (auto& m:G.legal) {
+            if (m.tr!=r||m.tc!=c) continue;
+            if (G.board[r][c]!='.') {
+                HPEN pen=CreatePen(PS_SOLID,5,C_LEGAL); HGDIOBJ op=SelectObject(hdc,pen);
+                SelectObject(hdc,GetStockObject(NULL_BRUSH));
+                Ellipse(hdc,OX+c*SQ+4,OY+r*SQ+4,OX+c*SQ+SQ-4,OY+r*SQ+SQ-4);
+                SelectObject(hdc,op); DeleteObject(pen);
+            } else {
+                int cx=OX+c*SQ+SQ/2, cy=OY+r*SQ+SQ/2;
+                HBRUSH db=CreateSolidBrush(C_LEGAL); HGDIOBJ op=SelectObject(hdc,db);
+                HPEN pen=CreatePen(PS_SOLID,1,C_LEGAL); HGDIOBJ op2=SelectObject(hdc,pen);
+                Ellipse(hdc,cx-12,cy-12,cx+12,cy+12);
+                SelectObject(hdc,op); SelectObject(hdc,op2);
+                DeleteObject(db); DeleteObject(pen);
+            }
+        }
+    }
+
+    // Pieces
+    HFONT old=SelectFont(hdc,hPF);
+    SetBkMode(hdc,TRANSPARENT);
+    for (int r=0;r<8;r++) for (int c=0;c<8;c++) {
+        char p=G.board[r][c]; if (p=='.') continue;
+        RECT sq={OX+c*SQ, OY+r*SQ, OX+c*SQ+SQ, OY+r*SQ+SQ};
+        if (isW(p)) {
+            SetTextColor(hdc,RGB(0,0,0));
+            RECT sh=sq; sh.left+=2; sh.top+=2;
+            DrawTextW(hdc,glyph(p),-1,&sh,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            SetTextColor(hdc,RGB(255,255,255));
+        } else {
+            SetTextColor(hdc,RGB(20,20,20));
+        }
+        DrawTextW(hdc,glyph(p),-1,&sq,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+    SelectFont(hdc,old);
+
+    // Labels
+    HFONT olds=SelectFont(hdc,hSF);
+    SetBkMode(hdc,TRANSPARENT); SetTextColor(hdc,RGB(180,180,180));
+    for (int i=0;i<8;i++) {
+        wchar_t buf[4];
+        RECT rr={5, OY+i*SQ+SQ/2-12, OX-5, OY+i*SQ+SQ/2+12};
+        wsprintf(buf,L"%d",8-i); DrawTextW(hdc,buf,-1,&rr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        RECT fr2={OX+i*SQ, OY+8*SQ+5, OX+i*SQ+SQ, OY+8*SQ+25};
+        wchar_t fc2[4]={(wchar_t)('a'+i),0}; DrawTextW(hdc,fc2,-1,&fr2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
+    // Status bar
+    RECT sr={0, OY+8*SQ+28, WIN_W, WIN_H};
+    SetBkMode(hdc,OPAQUE); SetBkColor(hdc,C_BG); SetTextColor(hdc,RGB(220,220,100));
+    std::wstring ws(G.status.begin(),G.status.end());
+    DrawTextW(hdc,ws.c_str(),-1,&sr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    SelectFont(hdc,olds);
+}
+
+// ===================== WINDOW PROC =====================
+static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc=BeginPaint(hw,&ps);
+        RECT rc; GetClientRect(hw,&rc);
+        HDC mem=CreateCompatibleDC(hdc);
+        HBITMAP bmp=CreateCompatibleBitmap(hdc,rc.right,rc.bottom);
+        HGDIOBJ old=SelectObject(mem,bmp);
+        HBRUSH bg=CreateSolidBrush(C_BG); FillRect(mem,&rc,bg); DeleteObject(bg);
+        render(mem);
+        BitBlt(hdc,0,0,rc.right,rc.bottom,mem,0,0,SRCCOPY);
+        SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem);
+        EndPaint(hw,&ps); return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        if (G.gameOver||G.sfBusy||!G.playerTurn) break;
+        int mx=GET_X_LPARAM(lp), my=GET_Y_LPARAM(lp);
+        int col=(mx-OX)/SQ, row=(my-OY)/SQ;
+        if (col<0||col>7||row<0||row>7) { G.selR=G.selC=-1; G.legal.clear(); InvalidateRect(hw,NULL,FALSE); break; }
+
+        if (G.selR>=0) {
+            for (auto& m:G.legal) {
+                if (m.tr==row&&m.tc==col) {
+                    applyMove(m);
+                    G.selR=G.selC=-1; G.legal.clear();
+                    bool oppW=!G.playerWhite;
+                    int kr,kc; findKing(G.board,oppW,kr,kc);
+                    G.inCheck=(kr>=0&&attacked(G.board,kr,kc,G.playerWhite));
+                    if (!anyLegal(oppW)) {
+                        G.gameOver=true;
+                        G.status=G.inCheck?"CHIEU TUONG! Ban da thang!":"HOA CO (Pat)!";
+                    } else {
+                        G.playerTurn=false;
+                        G.status=G.inCheck?"Stockfish bi chieu! Dang suy nghi...":"Stockfish dang suy nghi...";
+                        sfThink();
+                    }
+                    InvalidateRect(hw,NULL,FALSE); return 0;
+                }
+            }
+        }
+
+        G.selR=G.selC=-1; G.legal.clear();
+        char p=G.board[row][col];
+        if (G.playerWhite?isW(p):isB(p)) { G.selR=row; G.selC=col; G.legal=getLegal(row,col); }
+        InvalidateRect(hw,NULL,FALSE); break;
+    }
+    case WM_SF_DONE: {
+        char* best=(char*)lp;
+        G.sfBusy=false;
+        std::string mv=best?best:""; delete[] best;
+        if (mv.empty()||mv=="(none)") {
+            G.gameOver=true; G.status="Stockfish het nuoc di. Ban da thang!";
+        } else {
+            applyUCI(mv);
+            int kr,kc; findKing(G.board,G.playerWhite,kr,kc);
+            G.inCheck=(kr>=0&&attacked(G.board,kr,kc,!G.playerWhite));
+            if (!anyLegal(G.playerWhite)) {
+                G.gameOver=true;
+                G.status=G.inCheck?"CHIEU TUONG! Stockfish da thang!":"HOA CO (Pat)!";
+            } else {
+                G.playerTurn=true;
+                G.status=G.inCheck?"Ban bi chieu! Den luot cua ban.":"Den luot cua ban.";
+            }
+        }
+        InvalidateRect(hw,NULL,FALSE); break;
+    }
+    case WM_DESTROY:
+        if (G.sfProc) { DWORD w; WriteFile(G.sfIn,"quit\n",5,&w,NULL); CloseHandle(G.sfIn); CloseHandle(G.sfOut); CloseHandle(G.sfProc); CloseHandle(G.sfThr); }
+        DeleteObject(hPF); DeleteObject(hSF);
+        PostQuitMessage(0); return 0;
+    }
+    return DefWindowProc(hw,msg,wp,lp);
+}
+
+// ===================== INIT =====================
+static bool initSF() {
+    SECURITY_ATTRIBUTES sa{sizeof(sa),NULL,TRUE};
+    HANDLE ir,iw,or2,ow;
+    CreatePipe(&or2,&ow,&sa,0); SetHandleInformation(or2,HANDLE_FLAG_INHERIT,0);
+    CreatePipe(&ir,&iw,&sa,0);  SetHandleInformation(iw,HANDLE_FLAG_INHERIT,0);
+    STARTUPINFOA si{}; PROCESS_INFORMATION pi{};
+    si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES;
+    si.hStdInput=ir; si.hStdOutput=ow; si.hStdError=ow;
+    char cmd[256]; strcpy(cmd,SF_PATH);
+    if (!CreateProcessA(NULL,cmd,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)) return false;
+    CloseHandle(ir); CloseHandle(ow);
+    G.sfIn=iw; G.sfOut=or2; G.sfProc=pi.hProcess; G.sfThr=pi.hThread;
+    DWORD w;
+    WriteFile(G.sfIn,"uci\n",4,&w,NULL); sfRead("uciok");
+    WriteFile(G.sfIn,"ucinewgame\n",11,&w,NULL);
+    WriteFile(G.sfIn,"isready\n",8,&w,NULL); sfRead("readyok");
+    std::string sc="setoption name Skill Level value "+std::to_string(G.skillLv)+"\n";
+    WriteFile(G.sfIn,sc.c_str(),(DWORD)sc.size(),&w,NULL);
     return true;
 }
 
-// ===================== MAIN =====================
-int main() {
-    _setmode(_fileno(stdout), _O_U16TEXT); // bật Unicode output
-
-    HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
-
-    // Ẩn con trỏ khi animation
-    CONSOLE_CURSOR_INFO ci{1, FALSE};
-    SetConsoleCursorInfo(hCon, &ci);
-
-    // Khởi động Stockfish
-    SECURITY_ATTRIBUTES sa{sizeof(sa), NULL, TRUE};
-    HANDLE inRead, inWrite, outRead, outWrite;
-    CreatePipe(&outRead, &outWrite, &sa, 0);
-    SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
-    CreatePipe(&inRead, &inWrite, &sa, 0);
-    SetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFO si{}; PROCESS_INFORMATION pi{};
-    si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES;
-    si.hStdInput=inRead; si.hStdOutput=outWrite; si.hStdError=outWrite;
-
-    char cmd[256]; strcpy(cmd, STOCKFISH_PATH);
-    if (!CreateProcess(NULL,cmd,NULL,NULL,TRUE,0,NULL,NULL,&si,&pi)) {
-        wprintf(L"Khong mo duoc Stockfish! Kiem tra lai duong dan.\n");
-        return 1;
+static void initGame() {
+    const char* back="rnbqkbnr";
+    for (int c=0;c<8;c++) {
+        G.board[0][c]=back[c]; G.board[1][c]='p';
+        for (int r=2;r<6;r++) G.board[r][c]='.';
+        G.board[6][c]='P'; G.board[7][c]=(char)toupper(back[c]);
     }
-    CloseHandle(inRead); CloseHandle(outWrite);
+    G.wKM=G.bKM=G.wARM=G.wHRM=G.bARM=G.bHRM=false;
+    G.epR=G.epC=-1; G.selR=G.selC=-1; G.legal.clear();
+    G.lastFR=G.lastFC=G.lastTR=G.lastTC=-1;
+    G.inCheck=G.gameOver=G.sfBusy=false;
+    G.uciMoves.clear();
+}
 
-    DWORD written;
-    WriteFile(inWrite,"uci\n",4,&written,NULL);
-    readUntil(outRead,"uciok");
-    WriteFile(inWrite,"ucinewgame\n",11,&written,NULL);
-    WriteFile(inWrite,"isready\n",8,&written,NULL);
-    readUntil(outRead,"readyok");
-
-    // ---- Màn hình thiết lập ----
-    system("cls");
-    wprintf(L"===== CO VUA VS STOCKFISH =====\n");
-    wprintf(L"Dinh dang nuoc di: e2e4 | phong cap: e7e8q | 'thoat' de ket thuc\n\n");
-
-    // Chọn độ khó
-    wprintf(L"Chon do kho:\n");
-    wprintf(L"  1. De          (Skill  3,  200ms)\n");
-    wprintf(L"  2. Trung binh  (Skill 10,  500ms)\n");
-    wprintf(L"  3. Kho         (Skill 18, 1000ms)\n");
-    wprintf(L"  4. Chuyen gia  (Skill 20, 2000ms)\n");
-
-    int diff=0, skillLevel=20, movetime=1000;
-    while (diff<1||diff>4) {
-        wprintf(L"Lua chon (1-4): ");
-        std::cin>>diff;
-        if (diff<1||diff>4) wprintf(L"Vui long nhap so tu 1 den 4!\n");
+// ===================== WINMAIN =====================
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
+    int r1=MessageBoxA(NULL,"Chon nhom do kho:\n\nYes = De / Trung binh\nNo  = Kho / Chuyen gia","Do kho (1/2)",MB_YESNO|MB_ICONQUESTION);
+    if (r1==IDYES) {
+        int r2=MessageBoxA(NULL,"Yes = De (Skill 3, 200ms)\nNo  = Trung binh (Skill 10, 500ms)","Do kho (2/2)",MB_YESNO);
+        if (r2==IDYES){G.skillLv=3;G.movetime=200;}else{G.skillLv=10;G.movetime=500;}
+    } else {
+        int r2=MessageBoxA(NULL,"Yes = Kho (Skill 18, 1s)\nNo  = Chuyen gia (Skill 20, 2s)","Do kho (2/2)",MB_YESNO);
+        if (r2==IDYES){G.skillLv=18;G.movetime=1000;}else{G.skillLv=20;G.movetime=2000;}
     }
-    switch(diff) {
-        case 1: skillLevel=3;  movetime=200;  break;
-        case 2: skillLevel=10; movetime=500;  break;
-        case 3: skillLevel=18; movetime=1000; break;
-        case 4: skillLevel=20; movetime=2000; break;
-    }
-    {
-        std::string sc="setoption name Skill Level value "+std::to_string(skillLevel)+"\n";
-        WriteFile(inWrite,sc.c_str(),(DWORD)sc.size(),&written,NULL);
-    }
-    const wchar_t* diffNames[]={L"",L"De",L"Trung binh",L"Kho",L"Chuyen gia"};
-    wprintf(L"Do kho: %s\n\n", diffNames[diff]);
+    int rc=MessageBoxA(NULL,"Chon quan:\n\nYes = Trang (di truoc)\nNo  = Den (di sau)","Chon quan",MB_YESNO|MB_ICONQUESTION);
+    G.playerWhite=(rc==IDYES);
 
-    // Chọn màu quân
-    char col=0;
-    while (col!='T'&&col!='D') {
-        wprintf(L"Chon quan ([T]rang / [D]en): ");
-        std::string inp; std::cin>>inp;
-        col=(char)toupper(inp[0]);
-        if (col!='T'&&col!='D') wprintf(L"Vui long nhap T hoac D!\n");
-    }
-    bool isWhite=(col=='T');
-    wprintf(L"Ban choi quan %s\n", isWhite?L"TRANG (di truoc)":L"DEN (di sau)");
-    Sleep(800);
+    initGame();
+    if (!initSF()) { MessageBoxA(NULL,"Khong mo duoc Stockfish!\nKiem tra lai duong dan.","Loi",MB_OK|MB_ICONERROR); return 1; }
 
-    // ---- Game ----
-    system("cls");
-    initBoard();
-    const int BX=0, BY=1;   // vị trí bàn cờ
-    const int INFO_Y=BY+10; // vùng thông tin bên dưới
+    WNDCLASSA wc{};
+    wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
+    wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
+    wc.lpszClassName="ChessApp";
+    wc.hCursor=LoadCursor(NULL,IDC_ARROW);
+    RegisterClassA(&wc);
 
-    drawBoard(hCon, BX, BY);
+    hWnd=CreateWindowA("ChessApp","Co Vua vs Stockfish",
+        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
+        CW_USEDEFAULT,CW_USEDEFAULT,WIN_W+16,WIN_H+39,NULL,NULL,hInst,NULL);
 
-    std::vector<std::string> moves;
-    int turn=1;
+    hPF=CreateFontW(58,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI Symbol");
+    hSF=CreateFontW(16,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Arial");
 
-    // Stockfish đi trước nếu người chơi là quân đen
-    if (!isWhite) {
-        gotoXY(hCon, 0, INFO_Y);
-        wprintf(L"Stockfish dang suy nghi...                        ");
-        std::string best=getBestMove(inWrite,outRead,moves,movetime);
-        if (!best.empty()&&best!="(none)") {
-            animateMove(hCon, BX, BY, best);
-            moves.push_back(best);
-            gotoXY(hCon, 0, INFO_Y);
-            wprintf(L"Stockfish (Trang): %hs                           \n", best.c_str());
-        }
+    if (!G.playerWhite) {
+        G.playerTurn=false; G.status="Stockfish dang di nuoc dau...";
+        sfThink();
+    } else {
+        G.playerTurn=true; G.status="Den luot cua ban (Trang). Click vao quan de chon.";
     }
 
-    // Vòng lặp game
-    while (true) {
-        gotoXY(hCon, 0, INFO_Y+1);
-        wprintf(L"Luot %d | Nuoc cua ban (%s): ", turn, isWhite?L"Trang":L"Den");
-
-        std::string userMove;
-        std::cin>>userMove;
-
-        if (userMove=="thoat") break;
-
-        if (!isValidMove(userMove)) {
-            gotoXY(hCon, 0, INFO_Y+2);
-            wprintf(L"Sai dinh dang! Vi du hop le: e2e4 hoac e7e8q    ");
-            continue;
-        }
-
-        // Animate nước người chơi
-        animateMove(hCon, BX, BY, userMove);
-        moves.push_back(userMove);
-
-        gotoXY(hCon, 0, INFO_Y+2);
-        wprintf(L"Stockfish dang suy nghi...                           ");
-
-        std::string best=getBestMove(inWrite,outRead,moves,movetime);
-        if (best.empty()||best=="(none)") {
-            gotoXY(hCon, 0, INFO_Y+2);
-            wprintf(L"Stockfish khong tim duoc nuoc di. Ban da thang!  \n");
-            break;
-        }
-
-        // Animate nước Stockfish
-        animateMove(hCon, BX, BY, best);
-        moves.push_back(best);
-
-        gotoXY(hCon, 0, INFO_Y);
-        wprintf(L"Stockfish (%s): %hs                                  \n",
-                isWhite?L"Den":L"Trang", best.c_str());
-
-        turn++;
-    }
-
-    WriteFile(inWrite,"quit\n",5,&written,NULL);
-    CloseHandle(inWrite); CloseHandle(outRead);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-
-    ci.bVisible=TRUE;
-    SetConsoleCursorInfo(hCon, &ci);
-
-    gotoXY(hCon, 0, INFO_Y+3);
-    wprintf(L"Ket thuc game. Tam biet!\n");
-    return 0;
+    ShowWindow(hWnd,nShow); UpdateWindow(hWnd);
+    MSG msg;
+    while (GetMessage(&msg,NULL,0,0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    return (int)msg.wParam;
 }
