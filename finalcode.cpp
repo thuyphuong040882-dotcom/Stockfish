@@ -88,6 +88,7 @@ struct UndoInfo {
     bool wKM,bKM,wARM,wHRM,bARM,bHRM;
     int  epR,epC;
     bool playerTurn, inCheck;
+    int  lastFR,lastFC,lastTR,lastTC;
 };
 
 struct Drag { bool active; int srcR,srcC,cx,cy; char piece; };
@@ -109,10 +110,13 @@ static struct {
     Drag  drag;
     std::vector<UndoInfo> undoStack;
     std::vector<std::string> hist;
+    std::vector<unsigned long long> posHist; // for repetition detection
+    int histScroll;   // move history scroll offset (lines from bottom)
 } G;
 
 static TTEntry ttable[TT_SIZE];
 static unsigned long long ZKEYS[12][64], ZTURN, ZEP[8], ZCASTLE[4];
+static Move killers[64][2]; // 2 killer moves per depth
 
 static HWND  hWnd;
 static HFONT hPF, hSF, hBF;
@@ -175,12 +179,12 @@ static std::vector<Move> pseudoFor(const char b[8][8], int fr, int fc, int epR, 
     if(u=='P'){
         int dir=w?-1:1,sR=w?6:1,pR=w?0:7;
         if(inBnd(fr+dir,fc)&&b[fr+dir][fc]=='.'){
-            if(fr+dir==pR)add(fr+dir,fc,'q');
+            if(fr+dir==pR){for(char pp:{'q','r','b','n'})add(fr+dir,fc,pp);}
             else{add(fr+dir,fc);if(fr==sR&&b[fr+2*dir][fc]=='.')add(fr+2*dir,fc);}
         }
         for(int dc:{-1,1}){
             int tr2=fr+dir,tc2=fc+dc; if(!inBnd(tr2,tc2))continue;
-            if(isEnemy(b[tr2][tc2],w)){if(tr2==pR)add(tr2,tc2,'q');else add(tr2,tc2);}
+            if(isEnemy(b[tr2][tc2],w)){if(tr2==pR){for(char pp:{'q','r','b','n'})add(tr2,tc2,pp);}else add(tr2,tc2);}
             else if(tr2==epR&&tc2==epC)add(tr2,tc2,0,true);
         }
     }
@@ -204,19 +208,18 @@ static std::vector<Move> legalForBS(const BS& bs, int fr, int fc) {
     if((char)toupper(p)=='K'){
         int kRow=w?7:0; bool km=w?bs.wKM:bs.bKM;
         if(!km&&fr==kRow&&fc==4&&!attacked(bs.board,kRow,4,!w)){
-            auto castSide=[&](bool king){
-                bool rm=w?(king?bs.wHRM:bs.wARM):(king?bs.bHRM:bs.bARM);
-                int tc=king?6:2;
-                if(rm)return;
-                if(king&&(bs.board[kRow][5]!='.'||bs.board[kRow][6]!='.')&&true)return;
-                if(!king&&(bs.board[kRow][3]!='.'||bs.board[kRow][2]!='.'||bs.board[kRow][1]!='.')&&true)return;
-                int mid=king?5:3;
-                if(attacked(bs.board,kRow,mid,!w)||attacked(bs.board,kRow,tc,!w))return;
-                if(king&&(bs.board[kRow][5]!='.'||bs.board[kRow][6]!='.'))return;
-                if(!king&&(bs.board[kRow][3]!='.'||bs.board[kRow][2]!='.'||bs.board[kRow][1]!='.'))return;
-                legal.push_back({(signed char)fr,(signed char)fc,(signed char)kRow,(signed char)tc,0,false,true});
-            };
-            castSide(true); castSide(false);
+            // Kingside
+            if(!(w?bs.wHRM:bs.bHRM)){
+                if(bs.board[kRow][5]=='.'&&bs.board[kRow][6]=='.'&&
+                   !attacked(bs.board,kRow,5,!w)&&!attacked(bs.board,kRow,6,!w))
+                    legal.push_back({(signed char)fr,(signed char)fc,(signed char)kRow,6,0,false,true});
+            }
+            // Queenside
+            if(!(w?bs.wARM:bs.bARM)){
+                if(bs.board[kRow][3]=='.'&&bs.board[kRow][2]=='.'&&bs.board[kRow][1]=='.'&&
+                   !attacked(bs.board,kRow,3,!w)&&!attacked(bs.board,kRow,2,!w))
+                    legal.push_back({(signed char)fr,(signed char)fc,(signed char)kRow,2,0,false,true});
+            }
         }
     }
     return legal;
@@ -262,6 +265,9 @@ static void applyGlobal(const Move& m){
     G.hist.push_back(toUCI(m));
     doMove(G.board,m,G.epR,G.epC);
     G.lastFR=m.fr;G.lastFC=m.fc;G.lastTR=m.tr;G.lastTC=m.tc;
+    // Record position for repetition detection (reset on capture/pawn move)
+    if(G.board[m.tr][m.tc]!='.'||(char)toupper(p)=='P') G.posHist.clear();
+    G.posHist.push_back(zhash(toBS(),G.playerTurn));
 }
 
 // ─────────────────────── ZOBRIST ──────────────────────────────
@@ -310,15 +316,23 @@ static int evalAbs(const BS& bs){
 }
 
 // ─────────────── MOVE ORDERING ────────────────────────────────
-static int mvScore(const Move& m, const char b[8][8], const Move& tt){
-    if(mvEq(m,tt)) return 20000;
+static int mvScore(const Move& m, const char b[8][8], const Move& tt, int depth){
+    if(mvEq(m,tt)) return 25000;
     char v=b[m.tr][m.tc];
     if(v!='.'||m.ep){ char a=b[m.fr][m.fc]; return 10000+pval(v)*10-pval(a); }
     if(m.promo) return 9000;
+    if(depth>=0&&depth<64){
+        if(mvEq(m,killers[depth][0])) return 8000;
+        if(mvEq(m,killers[depth][1])) return 7000;
+    }
     return 0;
 }
-static void sortMoves(std::vector<Move>& mv, const char b[8][8], const Move& tt){
-    std::stable_sort(mv.begin(),mv.end(),[&](const Move&a,const Move&b2){return mvScore(a,b,tt)>mvScore(b2,b,tt);});
+static void sortMoves(std::vector<Move>& mv, const char b[8][8], const Move& tt, int depth=-1){
+    std::stable_sort(mv.begin(),mv.end(),[&](const Move&a,const Move&b2){return mvScore(a,b,tt,depth)>mvScore(b2,b,tt,depth);});
+}
+static void storeKiller(int depth, const Move& m){
+    if(depth<0||depth>=64) return;
+    if(!mvEq(m,killers[depth][0])){killers[depth][1]=killers[depth][0];killers[depth][0]=m;}
 }
 
 // ─────────────────── QUIESCENCE SEARCH ───────────────────────
@@ -355,13 +369,17 @@ static int negamax(const BS& bs, int depth, int alpha, int beta, bool white){
     }
     if(depth==0) return qsearch(bs,alpha,beta,white);
 
+    // 3-fold repetition → draw
+    int rCount=0;
+    for(auto ph:G.posHist) if(ph==h) if(++rCount>=2) return 0;
+
     std::vector<Move> all;
     for(int r=0;r<8;r++)for(int c=0;c<8;c++)
         if(white?isW(bs.board[r][c]):isB(bs.board[r][c])){auto v=legalForBS(bs,r,c);all.insert(all.end(),v.begin(),v.end());}
 
     if(all.empty()){int kr,kc;findKing(bs.board,white,kr,kc);return attacked(bs.board,kr,kc,!white)?-INF+depth:0;}
 
-    sortMoves(all,bs.board,ttMv);
+    sortMoves(all,bs.board,ttMv,depth);
 
     int origAlpha=alpha, best=-INF; Move bestMv=all[0];
     for(auto&m:all){
@@ -369,7 +387,11 @@ static int negamax(const BS& bs, int depth, int alpha, int beta, bool white){
         int s=-negamax(applyToBS(bs,m),depth-1,-beta,-alpha,!white);
         if(s>best){best=s;bestMv=m;}
         alpha=std::max(alpha,s);
-        if(alpha>=beta) break;
+        if(alpha>=beta){
+            // Quiet move caused cutoff: store as killer
+            if(bs.board[m.tr][m.tc]=='.'&&!m.ep&&!m.promo) storeKiller(depth,m);
+            break;
+        }
     }
     if(!timeUp()){
         tte.hash=h; tte.score=(short)best; tte.depth=(signed char)depth;
@@ -384,6 +406,7 @@ struct AIParam{ BS bs; bool aiWhite; int maxDepth; int timeLimitMs; };
 static DWORD WINAPI aiWorker(LPVOID p){
     AIParam* ap=(AIParam*)p;
     aiStartTick=GetTickCount(); aiTimeLimitMs=ap->timeLimitMs;
+    memset(killers,0xff,sizeof(killers));
     Move best=NULL_MV;
     for(int d=1;d<=ap->maxDepth&&!timeUp();d++){
         std::vector<Move> all;
@@ -395,7 +418,7 @@ static DWORD WINAPI aiWorker(LPVOID p){
         unsigned long long h=zhash(ap->bs,ap->aiWhite);
         TTEntry& tte=ttable[h&(TT_SIZE-1)];
         if(tte.hash==h)ttMv=tte.bestMv;
-        sortMoves(all,ap->bs.board,ttMv);
+        sortMoves(all,ap->bs.board,ttMv,d-1);
         Move depthBest=NULL_MV; int bestVal=-INF;
         for(auto&m:all){
             if(timeUp())break;
@@ -425,6 +448,7 @@ static void pushUndo(){
     UndoInfo ui; memcpy(ui.board,G.board,64);
     ui.wKM=G.wKM;ui.bKM=G.bKM;ui.wARM=G.wARM;ui.wHRM=G.wHRM;ui.bARM=G.bARM;ui.bHRM=G.bHRM;
     ui.epR=G.epR;ui.epC=G.epC;ui.playerTurn=G.playerTurn;ui.inCheck=G.inCheck;
+    ui.lastFR=G.lastFR;ui.lastFC=G.lastFC;ui.lastTR=G.lastTR;ui.lastTC=G.lastTC;
     G.undoStack.push_back(ui);
 }
 static void popUndo(){
@@ -433,9 +457,10 @@ static void popUndo(){
     memcpy(G.board,ui.board,64);
     G.wKM=ui.wKM;G.bKM=ui.bKM;G.wARM=ui.wARM;G.wHRM=ui.wHRM;G.bARM=ui.bARM;G.bHRM=ui.bHRM;
     G.epR=ui.epR;G.epC=ui.epC;G.playerTurn=ui.playerTurn;G.inCheck=ui.inCheck;
+    G.lastFR=ui.lastFR;G.lastFC=ui.lastFC;G.lastTR=ui.lastTR;G.lastTC=ui.lastTC;
     G.undoStack.pop_back();
     if(!G.hist.empty())G.hist.pop_back();
-    G.selR=G.selC=-1;G.legal.clear();G.lastFR=G.lastFC=G.lastTR=G.lastTC=-1;
+    G.selR=G.selC=-1;G.legal.clear();
     G.gameOver=false;
 }
 static void doUndo(){
@@ -655,16 +680,26 @@ static void render(HDC hdc){
     MoveToEx(hdc,px,32,NULL);LineTo(hdc,WIN_W,32);
     MoveToEx(hdc,px,WIN_H-34,NULL);LineTo(hdc,WIN_W,WIN_H-34);
     SelectObject(hdc,lop);DeleteObject(lp);
-    // Move history
+    // Move history (scrollable with mouse wheel)
     HFONT oldmf=SelectFont(hdc,hSF);
-    int hy=38;int start=(int)G.hist.size()>26?(int)G.hist.size()-26:0;
-    for(int i=start;i<(int)G.hist.size();i+=2){
+    int visLines=(WIN_H-74)/18; // lines that fit between dividers
+    int totalPairs=(int)G.hist.size()/2+((G.hist.size()%2)?1:0);
+    int scrollOff=std::max(0,std::min(G.histScroll,std::max(0,totalPairs-visLines)));
+    int hy=38;
+    for(int pair=scrollOff;pair<totalPairs&&hy<WIN_H-38;pair++){
+        int i=pair*2;
         std::string w2=G.hist[i],b2=(i+1<(int)G.hist.size())?G.hist[i+1]:"";
-        wchar_t line[48];wsprintfW(line,L"%2d.  %-7hs%hs",i/2+1,w2.c_str(),b2.c_str());
-        bool isLast=(i+1>=(int)G.hist.size()-1);
+        wchar_t line[48];wsprintfW(line,L"%2d. %-7hs%hs",pair+1,w2.c_str(),b2.c_str());
+        bool isLast=(pair==totalPairs-1);
         SetTextColor(hdc,isLast?RGB(230,230,180):RGB(150,155,160));
         RECT lr={px+6,hy,WIN_W-4,hy+18};DrawTextW(hdc,line,-1,&lr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        hy+=18;if(hy>WIN_H-40)break;
+        hy+=18;
+    }
+    // Scroll indicator
+    if(totalPairs>visLines){
+        SetTextColor(hdc,RGB(70,75,85));
+        RECT sr2={px+6,WIN_H-36,WIN_W-4,WIN_H-20};
+        DrawTextW(hdc,L"↑↓ cuon lich su",-1,&sr2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
     SelectFont(hdc,oldmf);
     // Status bar (below board)
@@ -678,11 +713,37 @@ static void render(HDC hdc){
     // Keyboard hint bar
     RECT hr={OX+8*SQ+2,OY+8*SQ+2,WIN_W,WIN_H};
     HFONT oldh=SelectFont(hdc,hSF);SetTextColor(hdc,RGB(90,95,105));SetBkMode(hdc,TRANSPARENT);
-    DrawTextW(hdc,L"^Z Undo  ^F FEN  ^S PGN",-1,&hr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    DrawTextW(hdc,L"^Z Undo  ^N New  ^F FEN  ^S PGN",-1,&hr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     SelectFont(hdc,oldh);
 }
 
+// ─────────────────────── PROMOTION PICKER ────────────────────
+static char askPromo(){
+    int r=MessageBoxW(hWnd,
+        L"Phong cap:\n\nYes = Hau (Q)  |  No = Xe (R)\n(Nhan Cancel = Tuong (B) / Phong (N))",
+        L"Phong cap",MB_YESNOCANCEL|MB_ICONQUESTION);
+    if(r==IDYES)   return 'q';
+    if(r==IDNO)    return 'r';
+    // Cancel => second dialog for minor pieces
+    int r2=MessageBoxW(hWnd,L"Yes = Tuong (B)\nNo  = Phong (N)",L"Phong cap",MB_YESNO|MB_ICONQUESTION);
+    return (r2==IDYES)?'b':'n';
+}
+
 // ─────────────────────── WNDPROC ──────────────────────────────
+// Pick promotion piece for player moves, then play it
+static void handlePlayerMove(Move m){
+    if(m.promo){
+        char chosen=askPromo();
+        // Find the matching legal move with the chosen promo piece
+        for(auto& lm:G.legal){
+            if(lm.fr==m.fr&&lm.fc==m.fc&&lm.tr==m.tr&&lm.tc==m.tc&&lm.promo==chosen){
+                m=lm; break;
+            }
+        }
+    }
+    handleMove(m);
+}
+
 static void handleMove(const Move& m){
     // Called when a legal move is confirmed (click or drop)
     pushUndo();
@@ -747,7 +808,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp){
         // Try apply legal move
         if(G.selR>=0){
             for(auto&m:G.legal){
-                if(m.tr==row&&m.tc==col){handleMove(m);return 0;}
+                if(m.tr==row&&m.tc==col){handlePlayerMove(m);return 0;}
             }
         }
         // Start drag or select
@@ -770,7 +831,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp){
         int col=(mx-OX)/SQ,row=(my-OY)/SQ;
         G.drag.active=false;
         if(inBnd(row,col)&&G.playerTurn&&!G.gameOver){
-            for(auto&m:G.legal){if(m.tr==row&&m.tc==col){handleMove(m);return 0;}}
+            for(auto&m:G.legal){if(m.tr==row&&m.tc==col){handlePlayerMove(m);return 0;}}
         }
         InvalidateRect(hw,NULL,FALSE);break;
     }
@@ -795,8 +856,15 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp){
         if(ctrl&&wp=='Z'){if(!G.aiBusy&&!G.anim.active)doUndo();}
         if(ctrl&&wp=='F'){if(!G.aiBusy&&!G.anim.active)loadFENFromClipboard();}
         if(ctrl&&wp=='S')savePGN();
+        if(ctrl&&wp=='N')startNewGame();
         if(wp==VK_ESCAPE){G.selR=G.selC=-1;G.legal.clear();G.drag.active=false;ReleaseCapture();InvalidateRect(hw,NULL,FALSE);}
         break;
+    }
+    case WM_MOUSEWHEEL:{
+        int delta=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
+        int maxScroll=std::max(0,(int)G.hist.size()/2-13);
+        G.histScroll=std::max(0,std::min(maxScroll,G.histScroll-delta));
+        InvalidateRect(hw,NULL,FALSE);break;
     }
     case WM_DESTROY:
         KillTimer(hw,TIMER_ANIM);KillTimer(hw,TIMER_CLOCK);
@@ -824,7 +892,25 @@ static void initGame(){
     G.wKM=G.bKM=G.wARM=G.wHRM=G.bARM=G.bHRM=false;G.epR=G.epC=-1;
     G.selR=G.selC=-1;G.legal.clear();G.lastFR=G.lastFC=G.lastTR=G.lastTC=-1;
     G.inCheck=G.gameOver=G.aiBusy=G.anim.active=G.drag.active=false;
-    G.undoStack.clear();G.hist.clear();
+    G.undoStack.clear();G.hist.clear();G.posHist.clear();G.histScroll=0;
+    memset(killers,0xff,sizeof(killers)); // -1 = null
+    memset(ttable,0,sizeof(ttable));
+}
+
+static void startNewGame(){
+    if(G.aiBusy){G.status="AI dang tinh, vui long doi...";InvalidateRect(hWnd,NULL,FALSE);return;}
+    // Re-ask settings
+    int r1=MessageBoxW(hWnd,L"Do kho:\nYes=De/TB  No=Kho/CG",L"Do kho",MB_YESNO);
+    if(r1==IDYES){int r2=MessageBoxW(hWnd,L"Yes=De(2)  No=TB(3)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?2:3;}
+    else         {int r2=MessageBoxW(hWnd,L"Yes=Kho(4)  No=CG(5)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?4:5;}
+    int rt=MessageBoxW(hWnd,L"Thoi gian:\nYes=5ph  No=10ph",L"Thoi gian",MB_YESNO);
+    G.playerClockMs=G.aiClockMs=(rt==IDYES)?5*60000:10*60000;
+    int rc=MessageBoxW(hWnd,L"Chon quan:\nYes=Trang  No=Den",L"Chon quan",MB_YESNO);
+    G.playerWhite=(rc==IDYES);
+    initGame();
+    if(!G.playerWhite){G.playerTurn=false;G.status="AI dang di nuoc dau...";startAI();}
+    else{G.playerTurn=true;G.status="Den luot cua ban. Click hoac keo quan.";}
+    InvalidateRect(hWnd,NULL,FALSE);
 }
 
 // ─────────────────────── WINMAIN ──────────────────────────────
@@ -853,7 +939,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
     wc.lpszClassName=L"ChessApp";wc.hCursor=LoadCursor(NULL,IDC_ARROW);
     RegisterClassW(&wc);
 
-    hWnd=CreateWindowW(L"ChessApp",L"Co Vua  •  Ctrl+Z Undo  Ctrl+F FEN  Ctrl+S PGN",
+    hWnd=CreateWindowW(L"ChessApp",L"Co Vua  •  Ctrl+Z Undo  Ctrl+N New  Ctrl+F FEN  Ctrl+S PGN",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         CW_USEDEFAULT,CW_USEDEFAULT,WIN_W+16,WIN_H+39,NULL,NULL,hInst,NULL);
 
