@@ -62,6 +62,7 @@ struct UndoInfo {
     bool playerTurn, inCheck;
     int  lastFR,lastFC,lastTR,lastTC;
     int  playerClockMs, aiClockMs;
+    int  halfmoveClock, fullmoveNum;
     std::vector<unsigned long long> repStack; // full snapshot for correct undo
 };
 
@@ -80,13 +81,19 @@ static struct {
     std::string status;
     int   aiDepth;
     int   playerClockMs, aiClockMs;
+    int   halfmoveClock, fullmoveNum;
     Anim  anim;
     Drag  drag;
     std::vector<UndoInfo> undoStack;
     std::vector<std::string> hist;
     std::vector<unsigned long long> repStack; // game-path hashes for repetition
     int   histScroll;
+    // Inline promotion picker
+    bool  promoPickMode;
+    int   promoFR,promoFC,promoTR,promoTC;
 } G;
+
+static volatile bool aiCancelled=false;
 
 static TTEntry ttable[TT_SIZE];
 static unsigned long long ZKEYS[12][64], ZTURN, ZEP[8], ZCASTLE[4];
@@ -106,7 +113,7 @@ inline bool isB(char p)           { return p>='a'&&p<='z'; }
 inline bool inBnd(int r,int c)    { return r>=0&&r<8&&c>=0&&c<8; }
 inline bool isEnemy(char p,bool w){ return w?isB(p):isW(p); }
 inline bool isFriend(char p,bool w){ return w?isW(p):isB(p); }
-inline bool timeUp(){ return (int)(GetTickCount()-aiStartTick)>=aiTimeLimitMs; }
+inline bool timeUp(){ return aiCancelled||(int)(GetTickCount()-aiStartTick)>=aiTimeLimitMs; }
 
 // POV-aware coordinate helpers (Black plays from bottom when !playerWhite)
 inline int bToSX(int c){ return OX+(G.playerWhite?c:7-c)*SQ+SQ/2; }
@@ -305,10 +312,17 @@ static void applyGlobal(const Move& m){
     doMove(G.board,m,G.epR,G.epC);
     G.lastFR=m.fr;G.lastFC=m.fc;G.lastTR=m.tr;G.lastTC=m.tc;
 
-    // Irreversible move clears rep stack
-    if(wasCapture||wasPawn) G.repStack.clear();
+    // Irreversible move resets halfmove clock and rep stack
+    if(wasCapture||wasPawn){ G.repStack.clear(); G.halfmoveClock=0; }
+    else G.halfmoveClock++;
+    if(!wasWhite) G.fullmoveNum++;
     // Hash uses side-to-move AFTER the move = !wasWhite
     G.repStack.push_back(zhash(toBS(),!wasWhite));
+
+    // Auto-scroll history to show latest moves
+    int total=(int)G.hist.size()/2+((int)G.hist.size()%2?1:0);
+    int visLines=(WIN_H-74)/18;
+    G.histScroll=std::max(0,total-visLines);
 }
 
 // ─────────────────── EVALUATION ──────────────────────────────
@@ -357,9 +371,32 @@ static int pst(char p,int r,int c){
 }
 static int evalAbs(const BS& bs){
     int s=0;
+    int wBish=0,bBish=0;
+    int wPawnsInFile[8]={},bPawnsInFile[8]={};
     for(int r=0;r<8;r++)for(int c=0;c<8;c++){
         char p=bs.board[r][c];if(p=='.')continue;
-        int v=pval(p)+pst(p,r,c);s+=isW(p)?v:-v;}
+        int v=pval(p)+pst(p,r,c);s+=isW(p)?v:-v;
+        if(p=='B')wBish++;
+        if(p=='b')bBish++;
+        if(p=='P')wPawnsInFile[c]++;
+        if(p=='p')bPawnsInFile[c]++;
+    }
+    // Bishop pair bonus
+    if(wBish>=2)s+=30;
+    if(bBish>=2)s-=30;
+    // Pawn structure: doubled and isolated
+    for(int c=0;c<8;c++){
+        if(wPawnsInFile[c]>0){
+            if(wPawnsInFile[c]>1) s-=(wPawnsInFile[c]-1)*15; // doubled
+            bool iso=(c==0||wPawnsInFile[c-1]==0)&&(c==7||wPawnsInFile[c+1]==0);
+            if(iso) s-=20;
+        }
+        if(bPawnsInFile[c]>0){
+            if(bPawnsInFile[c]>1) s+=(bPawnsInFile[c]-1)*15;
+            bool iso=(c==0||bPawnsInFile[c-1]==0)&&(c==7||bPawnsInFile[c+1]==0);
+            if(iso) s+=20;
+        }
+    }
     return s;
 }
 
@@ -445,15 +482,32 @@ static int negamax(const BS& bs,int depth,int alpha,int beta,bool white,
 
     repSt.push_back(h); // record that we entered this position
     int origAlpha=alpha, best=-INF; Move bestMv=all[0];
+    bool pvNode=true; int moveIdx=0;
     for(auto& m:all){
         if(timeUp()) break;
-        int s=-negamax(applyToBS(bs,m),depth-1,-beta,-alpha,!white,repSt);
+        bool quiet=(bs.board[m.tr][m.tc]=='.'&&!m.ep&&!m.promo);
+        int s;
+        if(pvNode){
+            // Full window for first move (PVS)
+            s=-negamax(applyToBS(bs,m),depth-1,-beta,-alpha,!white,repSt);
+            pvNode=false;
+        }else{
+            // LMR: reduce quiet moves beyond move 4 at depth >= 3
+            int rd=depth-1;
+            if(quiet&&depth>=3&&moveIdx>=4&&!inChk) rd=depth-2;
+            // Null-window search
+            s=-negamax(applyToBS(bs,m),rd,-alpha-1,-alpha,!white,repSt);
+            // Re-search with full window if it improves alpha (or was reduced)
+            if(s>alpha&&(s<beta||rd<depth-1))
+                s=-negamax(applyToBS(bs,m),depth-1,-beta,-alpha,!white,repSt);
+        }
         if(s>best){best=s;bestMv=m;}
         alpha=std::max(alpha,s);
         if(alpha>=beta){
-            if(bs.board[m.tr][m.tc]=='.'&&!m.ep&&!m.promo) storeKiller(depth,m);
+            if(quiet) storeKiller(depth,m);
             break;
         }
+        moveIdx++;
     }
     repSt.pop_back();
 
@@ -519,13 +573,16 @@ static DWORD WINAPI aiWorker(LPVOID p){
         if(!mvNull(dbest)&&!timeUp()){best=dbest; prevScore=bval;}
     }
 
-    Move* m=new Move(best);
-    PostMessage(hWnd,WM_AI_DONE,0,(LPARAM)m);
+    if(!aiCancelled){
+        Move* m=new Move(best);
+        PostMessage(hWnd,WM_AI_DONE,0,(LPARAM)m);
+    }
     delete ap; return 0;
 }
 
 static void startAI(){
     if(G.aiBusy||G.gameOver) return;
+    aiCancelled=false;
     G.aiBusy=true;
     AIParam* p=new AIParam;
     p->bs=toBS(); p->aiWhite=!G.playerWhite; p->maxDepth=G.aiDepth;
@@ -543,6 +600,7 @@ static void pushUndo(){
     ui.playerTurn=G.playerTurn;ui.inCheck=G.inCheck;
     ui.lastFR=G.lastFR;ui.lastFC=G.lastFC;ui.lastTR=G.lastTR;ui.lastTC=G.lastTC;
     ui.playerClockMs=G.playerClockMs;ui.aiClockMs=G.aiClockMs;
+    ui.halfmoveClock=G.halfmoveClock;ui.fullmoveNum=G.fullmoveNum;
     ui.repStack=G.repStack; // full snapshot
     G.undoStack.push_back(std::move(ui));
 }
@@ -556,6 +614,7 @@ static void popUndo(){
     G.playerTurn=ui.playerTurn;
     G.lastFR=ui.lastFR;G.lastFC=ui.lastFC;G.lastTR=ui.lastTR;G.lastTC=ui.lastTC;
     G.playerClockMs=ui.playerClockMs;G.aiClockMs=ui.aiClockMs;
+    G.halfmoveClock=ui.halfmoveClock;G.fullmoveNum=ui.fullmoveNum;
     G.repStack=ui.repStack;
     G.undoStack.pop_back();
     if(!G.hist.empty())G.hist.pop_back();
@@ -583,33 +642,66 @@ static void doUndo(){
 
 // ─────────────────── FEN / PGN ───────────────────────────────
 static bool loadFEN(const char* fen){
-    for(int r=0;r<8;r++)for(int c=0;c<8;c++)G.board[r][c]='.';
+    static const char* validPieces="KQRBNPkqrbnp";
+    // --- Validate and parse piece placement ---
+    char newBoard[8][8]; memset(newBoard,'.',64);
     const char* p=fen; int r=0,c=0;
     while(*p&&*p!=' '){
-        if(*p=='/'){r++;c=0;}
-        else if(*p>='1'&&*p<='8')c+=*p-'0';
-        else if(c<8&&r<8)G.board[r][c++]=*p;
+        if(*p=='/'){
+            if(c!=8) return false; // row must have 8 squares
+            r++;c=0; if(r>7) return false;
+        }else if(*p>='1'&&*p<='8'){
+            c+=*p-'0'; if(c>8) return false;
+        }else{
+            if(!strchr(validPieces,*p)) return false; // unknown piece
+            if(r>7||c>7) return false;
+            newBoard[r][c++]=*p;
+        }
         p++;
     }
+    if(r!=7||c!=8) return false; // must have exactly 8 rows
+    // --- Side to move ---
     if(*p==' ')p++;
-    bool fenWhite=(*p=='w');
+    if(*p!='w'&&*p!='b') return false;
+    bool fenWhite=(*p=='w'); p++;
+    // --- Castling ---
+    if(*p==' ')p++;
+    bool wKM=true,bKM=true,wARM=true,wHRM=true,bARM=true,bHRM=true;
+    while(*p&&*p!=' '&&*p!='-'){
+        if(*p=='K')wHRM=false; else if(*p=='Q')wARM=false;
+        else if(*p=='k')bHRM=false; else if(*p=='q')bARM=false;
+        else if(*p!='-') return false;
+        p++;
+    }
+    if(*p=='-')p++;
+    // --- En passant ---
+    if(*p==' ')p++;
+    int epR=-1,epC=-1;
+    if(*p&&*p!='-'){
+        if(*p<'a'||*p>'h') return false;
+        epC=*p-'a'; p++;
+        if(*p<'1'||*p>'8') return false;
+        epR=8-(*p-'0'); p++;
+    }else if(*p=='-') p++;
+    // --- Halfmove / fullmove clocks (optional) ---
+    if(*p==' ')p++;
+    int hmc=0,fmn=1;
+    if(*p&&*p>='0'&&*p<='9'){ hmc=0; while(*p&&*p!=' ')hmc=hmc*10+(*p++)-'0'; }
+    if(*p==' ')p++;
+    if(*p&&*p>='0'&&*p<='9'){ fmn=0; while(*p&&*p!=' ')fmn=fmn*10+(*p++)-'0'; }
+    // --- Commit valid state ---
+    memcpy(G.board,newBoard,64);
+    G.wKM=wKM;G.bKM=bKM;G.wARM=wARM;G.wHRM=wHRM;G.bARM=bARM;G.bHRM=bHRM;
+    G.epR=epR;G.epC=epC;
+    G.halfmoveClock=hmc; G.fullmoveNum=(fmn>0?fmn:1);
     G.playerTurn=(fenWhite==G.playerWhite);
-    while(*p&&*p!=' ')p++; if(*p==' ')p++;
-    G.wKM=G.bKM=G.wHRM=G.wARM=G.bHRM=G.bARM=true;
-    while(*p&&*p!=' '){
-        if(*p=='K')G.wHRM=false; if(*p=='Q')G.wARM=false;
-        if(*p=='k')G.bHRM=false; if(*p=='q')G.bARM=false;
-        p++;
-    }
-    if(*p==' ')p++;
-    G.epR=G.epC=-1;
-    if(*p&&*p!='-'&&*(p+1)){G.epC=p[0]-'a';G.epR=8-(p[1]-'0');}
     // Full reset of volatile state
     G.selR=G.selC=-1; G.legal.clear();
     G.lastFR=G.lastFC=G.lastTR=G.lastTC=-1;
     G.gameOver=G.aiBusy=false;
     G.anim.active=false; G.drag.active=false;
     G.undoStack.clear(); G.hist.clear(); G.repStack.clear(); G.histScroll=0;
+    G.promoPickMode=false;
     recomputeCheck();
     return true;
 }
@@ -630,16 +722,18 @@ static std::string toFEN(){
     if(!G.bKM&&!G.bHRM)ca+='k'; if(!G.bKM&&!G.bARM)ca+='q';
     fen+=ca.empty()?"-":ca; fen+=" ";
     if(G.epC>=0){fen+=(char)('a'+G.epC);fen+=(char)('0'+(8-G.epR));}else fen+="-";
-    fen+=" 0 1"; return fen;
+    fen+=" "; fen+=std::to_string(G.halfmoveClock);
+    fen+=" "; fen+=std::to_string(G.fullmoveNum); return fen;
 }
 static void loadFENFromClipboard(){
     if(!OpenClipboard(hWnd))return;
     HANDLE h=GetClipboardData(CF_TEXT);
     if(h){const char* t=(const char*)GlobalLock(h);
-          if(t){char buf[256];strncpy(buf,t,255);buf[255]=0;loadFEN(buf);}
+          if(t){char buf[512];strncpy(buf,t,511);buf[511]=0;
+                if(!loadFEN(buf)) G.status="FEN khong hop le!";
+                else G.status="FEN da tai tu clipboard.";}
           GlobalUnlock(h);}
     CloseClipboard();
-    G.status="FEN da tai tu clipboard.";
     InvalidateRect(hWnd,NULL,FALSE);
 }
 static void savePGN(){
@@ -774,10 +868,13 @@ static void render(HDC hdc){
     for(int i=0;i<8;i++){
         int boardR=G.playerWhite?i:7-i;
         int boardC=G.playerWhite?i:7-i;
-        SetTextColor(hdc,(i%2==0)?C_DARK:C_LIGHT);
+        // Rank label: col=0, so square color = (boardR+0)%2. Light sq → dark label.
+        bool rankSqLight=(boardR%2==0);
+        SetTextColor(hdc,rankSqLight?C_DARK:C_LIGHT);
         RECT rr={OX+3,OY+i*SQ+3,OX+18,OY+i*SQ+19};
         wchar_t nb[4]; wsprintfW(nb,L"%d",8-boardR);
         DrawTextW(hdc,nb,-1,&rr,DT_LEFT|DT_TOP);
+        // File label: at bottom of board. Square color at screen col i = (7+i)%2 = (7-i)%2.
         SetTextColor(hdc,((7-i)%2==0)?C_DARK:C_LIGHT);
         RECT fr2={OX+i*SQ+SQ-17,OY+8*SQ-18,OX+i*SQ+SQ-2,OY+8*SQ-3};
         wchar_t fc[4]={(wchar_t)('a'+boardC),0};
@@ -867,17 +964,31 @@ static void render(HDC hdc){
      SetTextColor(hdc,RGB(90,95,105));SetBkMode(hdc,TRANSPARENT);
      DrawTextW(hdc,L"^Z Undo  ^N New  ^F FEN  ^S PGN",-1,&hr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
      SelectFont(hdc,oldh);}
-}
 
-// ─────────────────── PROMOTION PICKER ────────────────────────
-static char askPromo(){
-    int r=MessageBoxW(hWnd,
-        L"Phong cap:\n\nYes = Hau (Q)  |  No = Xe (R)\nCancel = Tuong(B) / Phong(N)",
-        L"Phong cap",MB_YESNOCANCEL|MB_ICONQUESTION);
-    if(r==IDYES) return 'q';
-    if(r==IDNO)  return 'r';
-    int r2=MessageBoxW(hWnd,L"Yes = Tuong (B)\nNo = Phong (N)",L"Phong cap",MB_YESNO);
-    return (r2==IDYES)?'b':'n';
+    // Inline promotion picker — 4 squares in the promotion column (always starts at screen row 0)
+    if(G.promoPickMode){
+        const char promos[]={'q','r','b','n'};
+        int sx=sqLeft(G.promoTC);
+        int startSR=(sqTop(G.promoTR)-OY)/SQ; // = 0 (promotion square is always at top from player POV)
+        for(int i=0;i<4;i++){
+            int sy=OY+(startSR+i)*SQ;
+            RECT sq2={sx,sy,sx+SQ,sy+SQ};
+            HBRUSH sqb=CreateSolidBrush(RGB(50,55,65));FillRect(hdc,&sq2,sqb);DeleteObject(sqb);
+            HPEN hp=CreatePen(PS_SOLID,3,RGB(220,200,60));
+            HGDIOBJ hop=SelectObject(hdc,hp);
+            HBRUSH nb2=(HBRUSH)GetStockObject(NULL_BRUSH);
+            HGDIOBJ hob=SelectObject(hdc,nb2);
+            Rectangle(hdc,sx+2,sy+2,sx+SQ-2,sy+SQ-2);
+            SelectObject(hdc,hop);SelectObject(hdc,hob);DeleteObject(hp);
+            char piece=G.playerWhite?(char)toupper(promos[i]):promos[i];
+            drawPiece(hdc,piece,sx+SQ/2,sy+SQ/2);
+        }
+        SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(255,255,100));
+        HFONT olf=SelectFont(hdc,hBF);
+        RECT lr={OX,OY+8*SQ-20,OX+8*SQ,OY+8*SQ};
+        DrawTextW(hdc,L"Click de chon quan phong cap",-1,&lr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        SelectFont(hdc,olf);
+    }
 }
 
 // ─────────────────── GAME FLOW ───────────────────────────────
@@ -885,9 +996,12 @@ static void handleMove(const Move& m);
 
 static void handlePlayerMove(Move m){
     if(m.promo){
-        char chosen=askPromo();
-        for(auto& lm:G.legal)
-            if(lm.fr==m.fr&&lm.fc==m.fc&&lm.tr==m.tr&&lm.tc==m.tc&&lm.promo==chosen){m=lm;break;}
+        // Enter inline promotion pick mode — render() will show the picker
+        G.promoPickMode=true;
+        G.promoFR=m.fr; G.promoFC=m.fc; G.promoTR=m.tr; G.promoTC=m.tc;
+        G.selR=G.selC=-1; G.legal.clear(); G.drag.active=false;
+        InvalidateRect(hWnd,NULL,FALSE);
+        return;
     }
     handleMove(m);
 }
@@ -957,6 +1071,30 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     case WM_LBUTTONDOWN:{
         if(G.gameOver||G.anim.active)break;
         int mx=GET_X_LPARAM(lp),my=GET_Y_LPARAM(lp);
+
+        // Handle inline promotion picker
+        if(G.promoPickMode){
+            int sx=sqLeft(G.promoTC);
+            int startSR=(sqTop(G.promoTR)-OY)/SQ;
+            const char promos[]={'q','r','b','n'};
+            if(mx>=sx&&mx<sx+SQ){
+                int pick=(my-OY)/SQ - startSR;
+                if(pick>=0&&pick<4){
+                    char chosen=promos[pick];
+                    G.promoPickMode=false;
+                    BS bs=toBS();
+                    auto legals=legalForBS(bs,G.promoFR,G.promoFC);
+                    for(auto& lm:legals){
+                        if(lm.tr==G.promoTR&&lm.tc==G.promoTC&&lm.promo==chosen){
+                            handleMove(lm); return 0;}
+                    }
+                }
+            }
+            G.promoPickMode=false;
+            InvalidateRect(hw,NULL,FALSE);
+            break;
+        }
+
         int row=sToR(my),col=sToC(mx);
         if(!G.playerTurn)break;
         if(row<0||row>7||col<0||col>7){G.selR=G.selC=-1;G.legal.clear();InvalidateRect(hw,NULL,FALSE);break;}
@@ -1029,6 +1167,7 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         InvalidateRect(hw,NULL,FALSE);break;
     }
     case WM_DESTROY:
+        aiCancelled=true;
         KillTimer(hw,TIMER_ANIM);KillTimer(hw,TIMER_CLOCK);
         DeleteObject(hPF);DeleteObject(hSF);DeleteObject(hBF);
         for(int i=0;i<12;i++)if(pieceImgs[i])delete pieceImgs[i];
@@ -1062,12 +1201,13 @@ static void initGame(){
     G.selR=G.selC=-1;G.legal.clear();G.lastFR=G.lastFC=G.lastTR=G.lastTC=-1;
     G.inCheck=G.gameOver=G.aiBusy=G.anim.active=G.drag.active=false;
     G.undoStack.clear();G.hist.clear();G.repStack.clear();G.histScroll=0;
+    G.halfmoveClock=0;G.fullmoveNum=1;G.promoPickMode=false;
     memset(killers,0xff,sizeof(killers));
     memset(ttable,0,sizeof(ttable));
 }
 
 static void startNewGame(){
-    if(G.aiBusy){G.status="AI dang tinh, vui long doi...";InvalidateRect(hWnd,NULL,FALSE);return;}
+    if(G.aiBusy){aiCancelled=true;G.aiBusy=false;Sleep(50);}
     int r1=MessageBoxW(hWnd,L"Do kho:\nYes=De/TB  No=Kho/CG",L"Do kho",MB_YESNO);
     if(r1==IDYES){int r2=MessageBoxW(hWnd,L"Yes=De(2)  No=TB(3)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?2:3;}
     else         {int r2=MessageBoxW(hWnd,L"Yes=Kho(4)  No=CG(5)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?4:5;}
