@@ -110,6 +110,8 @@ static HWND       hWnd;
 static HFONT      hPF,hSF,hBF,hCF; // hCF = small piece glyph font for captured pieces
 static ULONG_PTR  gdipToken;
 static Gdiplus::Bitmap* pieceImgs[12];
+static Gdiplus::Bitmap* bgKnight=nullptr; // background/icon image
+static HICON      hAppIcon=NULL;
 static bool       hasPNG=false;
 static DWORD      aiStartTick;
 static int        aiTimeLimitMs;
@@ -913,6 +915,25 @@ static void render(HDC hdc){
         findKing(G.board,sideW,ckR,ckC);
     }
 
+    // ── Knight background watermark (drawn before everything, behind board) ──
+    if(bgKnight){
+        Gdiplus::Graphics gfx(hdc);
+        gfx.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        // 13% opacity — visible but doesn't obscure board
+        Gdiplus::ColorMatrix cm={{{1,0,0,0,0},{0,1,0,0,0},{0,0,1,0,0},
+                                   {0,0,0,.13f,0},{0,0,0,0,1}}};
+        Gdiplus::ImageAttributes ia;
+        ia.SetColorMatrix(&cm,Gdiplus::ColorMatrixFlagsDefault,
+                          Gdiplus::ColorAdjustTypeBitmap);
+        Gdiplus::REAL iw=(Gdiplus::REAL)bgKnight->GetWidth();
+        Gdiplus::REAL ih=(Gdiplus::REAL)bgKnight->GetHeight();
+        gfx.DrawImage(bgKnight,
+            Gdiplus::RectF((Gdiplus::REAL)OX,(Gdiplus::REAL)OY,
+                           (Gdiplus::REAL)(8*SQ),(Gdiplus::REAL)(8*SQ)),
+            0,0,iw,ih,Gdiplus::UnitPixel,&ia);
+    }
+
     // ── Board squares ──
     for(int r=0;r<8;r++)for(int c=0;c<8;c++){
         bool lt=(r+c)%2==0;
@@ -1337,6 +1358,8 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         KillTimer(hw,TIMER_ANIM);KillTimer(hw,TIMER_CLOCK);
         DeleteObject(hPF);DeleteObject(hSF);DeleteObject(hBF);DeleteObject(hCF);
         for(int i=0;i<12;i++)if(pieceImgs[i])delete pieceImgs[i];
+        if(bgKnight){delete bgKnight;bgKnight=nullptr;}
+        if(hAppIcon){DestroyIcon(hAppIcon);hAppIcon=NULL;}
         Gdiplus::GdiplusShutdown(gdipToken);
         PostQuitMessage(0);return 0;
     }
@@ -1344,6 +1367,13 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
 }
 
 // ─────────────────── INIT ────────────────────────────────────
+static void loadBgImage(){
+    bgKnight=new Gdiplus::Bitmap(L"knight.png");
+    if(bgKnight->GetLastStatus()!=Gdiplus::Ok){
+        delete bgKnight; bgKnight=nullptr;
+    }
+}
+
 static void loadPieceImages(){
     const wchar_t* names[]={
         L"pieces\\wK.png",L"pieces\\wQ.png",L"pieces\\wR.png",
@@ -1437,6 +1467,16 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
                     CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     hCF=CreateFontW(18,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI Symbol");
+
+    // Load background knight image + set as window icon
+    loadBgImage();
+    if(bgKnight){
+        bgKnight->GetHICON(&hAppIcon);
+        if(hAppIcon){
+            SendMessage(hWnd,WM_SETICON,ICON_BIG,(LPARAM)hAppIcon);
+            SendMessage(hWnd,WM_SETICON,ICON_SMALL,(LPARAM)hAppIcon);
+        }
+    }
 
     SetTimer(hWnd,TIMER_CLOCK,100,NULL);
 
