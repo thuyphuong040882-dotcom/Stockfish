@@ -1,9 +1,18 @@
 /*
  * Chess vs AI — single-file Win32/GDI+
- * Compile:
+ *
+ * Compile (2 bước — icon nhúng vào exe):
+ *   windres app.rc -o app_res.o
+ *   g++ finalcode.cpp app_res.o -o chess.exe -lgdi32 -luser32 -lgdiplus -lcomdlg32 -mwindows -std=c++14
+ *
+ * Hoặc không cần icon:
  *   g++ finalcode.cpp -o chess.exe -lgdi32 -luser32 -lgdiplus -lcomdlg32 -mwindows -std=c++14
  *
- * PNG pieces (optional): create "pieces\" folder next to .exe, add wK/wQ/wR/wB/wN/wP/bK.../bP.png
+ * File cần có cùng thư mục với chess.exe:
+ *   knight.png   — ảnh nền mờ + icon cửa sổ (title bar)
+ *   icon.ico     — icon file exe (Windows Explorer)
+ *   pieces\      — (tùy chọn) ảnh PNG quân cờ wK/wQ/.../bP.png
+ *
  * Keyboard: Ctrl+Z Undo | Ctrl+N New | Ctrl+F FEN | Ctrl+S PGN | Escape deselect
  */
 #define UNICODE
@@ -1452,6 +1461,10 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
     wc.lpfnWndProc=WndProc;wc.hInstance=hInst;
     wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
     wc.lpszClassName=L"ChessApp";wc.hCursor=LoadCursor(NULL,IDC_ARROW);
+    // Use embedded icon (IDI_ICON1 from app.rc / icon.ico)
+    wc.hIcon  =LoadIconW(hInst,MAKEINTRESOURCEW(1));
+    wc.hIconSm=LoadIconW(hInst,MAKEINTRESOURCEW(1));
+    if(!wc.hIcon) wc.hIcon=LoadIconW(NULL,IDI_APPLICATION);
     RegisterClassW(&wc);
 
     hWnd=CreateWindowW(L"ChessApp",
