@@ -15,6 +15,8 @@
 #include <vector>
 #include <cstring>
 #include <cctype>
+#include <cmath>
+#include <atomic>
 #include <algorithm>
 
 #pragma comment(lib,"gdi32.lib")
@@ -63,7 +65,8 @@ struct UndoInfo {
     int  lastFR,lastFC,lastTR,lastTC;
     int  playerClockMs, aiClockMs;
     int  halfmoveClock, fullmoveNum;
-    std::vector<unsigned long long> repStack; // full snapshot for correct undo
+    std::vector<unsigned long long> repStack;
+    std::vector<char> capturedByW, capturedByB;
 };
 
 struct Drag { bool active; int srcR,srcC,cx,cy; char piece; };
@@ -91,16 +94,20 @@ static struct {
     // Inline promotion picker
     bool  promoPickMode;
     int   promoFR,promoFC,promoTR,promoTC;
+    // Captured pieces (by each side)
+    std::vector<char> capturedByW; // black pieces captured by white
+    std::vector<char> capturedByB; // white pieces captured by black
 } G;
 
-static volatile bool aiCancelled=false;
+static std::atomic<bool> aiCancelled(false);
+static HANDLE aiThreadHandle=NULL;
 
 static TTEntry ttable[TT_SIZE];
 static unsigned long long ZKEYS[12][64], ZTURN, ZEP[8], ZCASTLE[4];
 static Move killers[64][2];
 
 static HWND       hWnd;
-static HFONT      hPF,hSF,hBF;
+static HFONT      hPF,hSF,hBF,hCF; // hCF = small piece glyph font for captured pieces
 static ULONG_PTR  gdipToken;
 static Gdiplus::Bitmap* pieceImgs[12];
 static bool       hasPNG=false;
@@ -307,6 +314,18 @@ static void applyGlobal(const Move& m){
     bool wasPawn=((char)toupper(G.board[m.fr][m.fc])=='P');
     bool wasWhite=isW(G.board[m.fr][m.fc]);
 
+    // Track captured pieces
+    char cap=G.board[m.tr][m.tc];
+    if(cap!='.'){
+        if(isW(cap)) G.capturedByB.push_back(cap);
+        else         G.capturedByW.push_back(cap);
+    }
+    if(m.ep){
+        char epPawn=G.board[wasWhite?m.tr+1:m.tr-1][m.tc];
+        if(isW(epPawn)) G.capturedByB.push_back(epPawn);
+        else            G.capturedByW.push_back(epPawn);
+    }
+
     updCastle(G.wKM,G.bKM,G.wARM,G.wHRM,G.bARM,G.bHRM,G.board,m);
     G.hist.push_back(toUCI(m));
     doMove(G.board,m,G.epR,G.epC);
@@ -319,9 +338,9 @@ static void applyGlobal(const Move& m){
     // Hash uses side-to-move AFTER the move = !wasWhite
     G.repStack.push_back(zhash(toBS(),!wasWhite));
 
-    // Auto-scroll history to show latest moves
+    // Auto-scroll history to show latest moves (histY0=68, histY1=WIN_H-50)
     int total=(int)G.hist.size()/2+((int)G.hist.size()%2?1:0);
-    int visLines=(WIN_H-74)/18;
+    int visLines=(WIN_H-118)/18;
     G.histScroll=std::max(0,total-visLines);
 }
 
@@ -373,21 +392,21 @@ static int evalAbs(const BS& bs){
     int s=0;
     int wBish=0,bBish=0;
     int wPawnsInFile[8]={},bPawnsInFile[8]={};
+    int wKr=-1,wKc=-1,bKr=-1,bKc=-1;
+    // Material + PST
     for(int r=0;r<8;r++)for(int c=0;c<8;c++){
         char p=bs.board[r][c];if(p=='.')continue;
         int v=pval(p)+pst(p,r,c);s+=isW(p)?v:-v;
-        if(p=='B')wBish++;
-        if(p=='b')bBish++;
-        if(p=='P')wPawnsInFile[c]++;
-        if(p=='p')bPawnsInFile[c]++;
+        if(p=='B')wBish++;  if(p=='b')bBish++;
+        if(p=='P')wPawnsInFile[c]++;  if(p=='p')bPawnsInFile[c]++;
+        if(p=='K'){wKr=r;wKc=c;}  if(p=='k'){bKr=r;bKc=c;}
     }
-    // Bishop pair bonus
-    if(wBish>=2)s+=30;
-    if(bBish>=2)s-=30;
-    // Pawn structure: doubled and isolated
+    // Bishop pair
+    if(wBish>=2)s+=30;  if(bBish>=2)s-=30;
+    // Pawn structure: doubled, isolated, passed
     for(int c=0;c<8;c++){
         if(wPawnsInFile[c]>0){
-            if(wPawnsInFile[c]>1) s-=(wPawnsInFile[c]-1)*15; // doubled
+            if(wPawnsInFile[c]>1) s-=(wPawnsInFile[c]-1)*15;
             bool iso=(c==0||wPawnsInFile[c-1]==0)&&(c==7||wPawnsInFile[c+1]==0);
             if(iso) s-=20;
         }
@@ -397,6 +416,54 @@ static int evalAbs(const BS& bs){
             if(iso) s+=20;
         }
     }
+    // Passed pawns
+    for(int r=1;r<7;r++)for(int c=0;c<8;c++){
+        if(bs.board[r][c]=='P'){
+            bool passed=true;
+            for(int rr=0;rr<r&&passed;rr++){
+                if(bs.board[rr][c]=='p') passed=false;
+                if(c>0&&bs.board[rr][c-1]=='p') passed=false;
+                if(c<7&&bs.board[rr][c+1]=='p') passed=false;
+            }
+            if(passed) s+=(7-r)*12; // closer to promotion = bigger bonus
+        }
+        if(bs.board[r][c]=='p'){
+            bool passed=true;
+            for(int rr=r+1;rr<8&&passed;rr++){
+                if(bs.board[rr][c]=='P') passed=false;
+                if(c>0&&bs.board[rr][c-1]=='P') passed=false;
+                if(c<7&&bs.board[rr][c+1]=='P') passed=false;
+            }
+            if(passed) s-=r*12;
+        }
+    }
+    // Rook bonuses: open/semi-open file (+20/+10), 7th rank (+25)
+    for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+        if(bs.board[r][c]=='R'){
+            if(!wPawnsInFile[c]&&!bPawnsInFile[c]) s+=20;
+            else if(!wPawnsInFile[c]) s+=10;
+            if(r==1) s+=25; // 7th rank (threatens black pawns on starting rank)
+        }
+        if(bs.board[r][c]=='r'){
+            if(!wPawnsInFile[c]&&!bPawnsInFile[c]) s-=20;
+            else if(!bPawnsInFile[c]) s-=10;
+            if(r==6) s-=25;
+        }
+    }
+    // King safety: count pawn shield (up to 3 pawns in front)
+    auto kingSafety=[&](int kr,int kc,bool w)->int{
+        if(kr<0) return 0;
+        int shield=0, dir=w?-1:1;
+        char P=w?'P':'p';
+        for(int dc=-1;dc<=1;dc++){
+            int nc=kc+dc; if(nc<0||nc>7) continue;
+            if(inBnd(kr+dir,nc)&&bs.board[kr+dir][nc]==P) shield+=15;
+            else if(inBnd(kr+2*dir,nc)&&bs.board[kr+2*dir][nc]==P) shield+=5;
+        }
+        return shield;
+    };
+    s+=kingSafety(wKr,wKc,true);
+    s-=kingSafety(bKr,bKc,false);
     return s;
 }
 
@@ -582,13 +649,14 @@ static DWORD WINAPI aiWorker(LPVOID p){
 
 static void startAI(){
     if(G.aiBusy||G.gameOver) return;
-    aiCancelled=false;
+    aiCancelled.store(false);
     G.aiBusy=true;
     AIParam* p=new AIParam;
     p->bs=toBS(); p->aiWhite=!G.playerWhite; p->maxDepth=G.aiDepth;
     int clk=G.aiClockMs; p->timeLimitMs=std::max(300,std::min(8000,clk/20));
     p->repSt=G.repStack;
-    HANDLE h=CreateThread(NULL,0,aiWorker,p,0,NULL); CloseHandle(h);
+    if(aiThreadHandle!=NULL){CloseHandle(aiThreadHandle);aiThreadHandle=NULL;}
+    aiThreadHandle=CreateThread(NULL,0,aiWorker,p,0,NULL);
 }
 
 // ─────────────────── UNDO ────────────────────────────────────
@@ -601,7 +669,8 @@ static void pushUndo(){
     ui.lastFR=G.lastFR;ui.lastFC=G.lastFC;ui.lastTR=G.lastTR;ui.lastTC=G.lastTC;
     ui.playerClockMs=G.playerClockMs;ui.aiClockMs=G.aiClockMs;
     ui.halfmoveClock=G.halfmoveClock;ui.fullmoveNum=G.fullmoveNum;
-    ui.repStack=G.repStack; // full snapshot
+    ui.repStack=G.repStack;
+    ui.capturedByW=G.capturedByW; ui.capturedByB=G.capturedByB;
     G.undoStack.push_back(std::move(ui));
 }
 static void popUndo(){
@@ -616,6 +685,7 @@ static void popUndo(){
     G.playerClockMs=ui.playerClockMs;G.aiClockMs=ui.aiClockMs;
     G.halfmoveClock=ui.halfmoveClock;G.fullmoveNum=ui.fullmoveNum;
     G.repStack=ui.repStack;
+    G.capturedByW=ui.capturedByW; G.capturedByB=ui.capturedByB;
     G.undoStack.pop_back();
     if(!G.hist.empty())G.hist.pop_back();
     G.selR=G.selC=-1;G.legal.clear();
@@ -660,6 +730,13 @@ static bool loadFEN(const char* fen){
         p++;
     }
     if(r!=7||c!=8) return false; // must have exactly 8 rows
+    // --- Validate king counts ---
+    {int wK=0,bK=0;
+     for(int rr=0;rr<8;rr++)for(int cc=0;cc<8;cc++){
+         if(newBoard[rr][cc]=='K')wK++;
+         if(newBoard[rr][cc]=='k')bK++;
+     }
+     if(wK!=1||bK!=1) return false;}
     // --- Side to move ---
     if(*p==' ')p++;
     if(*p!='w'&&*p!='b') return false;
@@ -682,6 +759,12 @@ static bool loadFEN(const char* fen){
         epC=*p-'a'; p++;
         if(*p<'1'||*p>'8') return false;
         epR=8-(*p-'0'); p++;
+        // EP rank must be 2 (rank 6, white to move) or 5 (rank 3, black to move)
+        if(fenWhite&&epR!=2) return false;
+        if(!fenWhite&&epR!=5) return false;
+        // The corresponding pawn must be present
+        if(fenWhite&&(epC<0||epC>7||newBoard[3][epC]!='p')) return false;
+        if(!fenWhite&&(epC<0||epC>7||newBoard[4][epC]!='P')) return false;
     }else if(*p=='-') p++;
     // --- Halfmove / fullmove clocks (optional) ---
     if(*p==' ')p++;
@@ -702,6 +785,7 @@ static bool loadFEN(const char* fen){
     G.anim.active=false; G.drag.active=false;
     G.undoStack.clear(); G.hist.clear(); G.repStack.clear(); G.histScroll=0;
     G.promoPickMode=false;
+    G.capturedByW.clear();G.capturedByB.clear();
     recomputeCheck();
     return true;
 }
@@ -882,6 +966,25 @@ static void render(HDC hdc){
     }
     SelectFont(hdc,olds);
 
+    // ── Last-move arrow (drawn before pieces so pieces appear on top) ──
+    if(G.lastFR>=0&&!G.anim.active&&!G.promoPickMode){
+        int x1=bToSX(G.lastFC),y1=bToSY(G.lastFR);
+        int x2=bToSX(G.lastTC),y2=bToSY(G.lastTR);
+        HPEN ap=CreatePen(PS_SOLID,5,RGB(20,110,190));
+        HBRUSH ab=CreateSolidBrush(RGB(20,110,190));
+        HGDIOBJ aop=SelectObject(hdc,ap),aob=SelectObject(hdc,ab);
+        MoveToEx(hdc,x1,y1,NULL);LineTo(hdc,x2,y2);
+        double ddx=(double)(x2-x1),ddy=(double)(y2-y1);
+        double len=sqrt(ddx*ddx+ddy*ddy);
+        if(len>1.0){ddx/=len;ddy/=len;int hs=16;
+            POINT pts[3]={{x2,y2},
+                {(int)(x2-hs*ddx+hs/2*(-ddy)),(int)(y2-hs*ddy+hs/2*ddx)},
+                {(int)(x2-hs*ddx-hs/2*(-ddy)),(int)(y2-hs*ddy-hs/2*ddx)}};
+            Polygon(hdc,pts,3);}
+        SelectObject(hdc,aop);SelectObject(hdc,aob);
+        DeleteObject(ap);DeleteObject(ab);
+    }
+
     // ── Pieces ──
     for(int r=0;r<8;r++)for(int c=0;c<8;c++){
         char p=G.board[r][c]; if(p=='.') continue;
@@ -902,39 +1005,101 @@ static void render(HDC hdc){
      SelectObject(hdc,dop);DeleteObject(dp);}
     SetBkMode(hdc,TRANSPARENT);
 
+    // Helper: build sorted captured glyph string + material advantage
+    auto matInfo=[&](bool forWhite,std::wstring& glyphs,int& adv){
+        glyphs.clear(); adv=0;
+        auto sorted=forWhite?G.capturedByW:G.capturedByB; // pieces captured BY this side
+        std::stable_sort(sorted.begin(),sorted.end(),[](char a,char b){return pval(a)>pval(b);});
+        for(char pc:sorted) glyphs+=glyph(forWhite?(char)tolower(pc):(char)toupper(pc));
+        int myMat=0; for(char pc:(forWhite?G.capturedByW:G.capturedByB)) myMat+=pval(pc);
+        int oppMat=0; for(char pc:(forWhite?G.capturedByB:G.capturedByW)) oppMat+=pval(pc);
+        adv=myMat-oppMat;
+    };
+
+    // Determine which side is "white" for display
+    bool aiIsWhite=!G.playerWhite;
+
     HFONT oldbf=SelectFont(hdc,hBF);
-    // Opponent clock (top)
+    // Opponent (AI) clock + captures
     {std::string s=G.playerWhite?"Black (AI)":"White (AI)";
      std::wstring sw(s.begin(),s.end());
-     RECT lbl={px+6,6,WIN_W-6,26};
+     RECT lbl={px+6,4,WIN_W-6,22};
      SetTextColor(hdc,C_TEXT);
      DrawTextW(hdc,sw.c_str(),-1,&lbl,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
      SetTextColor(hdc,G.aiBusy?RGB(250,200,80):C_TEXT);
      DrawTextW(hdc,fmtClock(G.aiClockMs).c_str(),-1,&lbl,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);}
-    // Player clock (bottom)
+    {std::wstring glyphs; int adv;
+     matInfo(aiIsWhite,glyphs,adv);
+     HFONT cf=SelectFont(hdc,hCF);
+     RECT cr={px+6,22,WIN_W-6,38};
+     SetTextColor(hdc,RGB(130,135,145));
+     if(!glyphs.empty()) DrawTextW(hdc,glyphs.c_str(),-1,&cr,DT_LEFT|DT_TOP);
+     if(adv>0){wchar_t ms[8];wsprintfW(ms,L"+%d",adv/100);
+               SetTextColor(hdc,RGB(200,220,130));SelectFont(hdc,hSF);
+               DrawTextW(hdc,ms,-1,&cr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);}
+     SelectFont(hdc,cf);}
+    // Player clock + captures
     {std::string s=G.playerWhite?"White (You)":"Black (You)";
      std::wstring sw(s.begin(),s.end());
-     RECT lbl={px+6,WIN_H-30,WIN_W-6,WIN_H-8};
+     RECT lbl={px+6,WIN_H-30,WIN_W-6,WIN_H-12};
      SetTextColor(hdc,C_TEXT);
      DrawTextW(hdc,sw.c_str(),-1,&lbl,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
      SetTextColor(hdc,G.playerTurn?RGB(250,200,80):C_TEXT);
      DrawTextW(hdc,fmtClock(G.playerClockMs).c_str(),-1,&lbl,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);}
+    {std::wstring glyphs; int adv;
+     matInfo(!aiIsWhite,glyphs,adv);
+     HFONT cf=SelectFont(hdc,hCF);
+     RECT cr={px+6,WIN_H-44,WIN_W-6,WIN_H-30};
+     SetTextColor(hdc,RGB(130,135,145));
+     if(!glyphs.empty()) DrawTextW(hdc,glyphs.c_str(),-1,&cr,DT_LEFT|DT_TOP);
+     if(adv>0){wchar_t ms[8];wsprintfW(ms,L"+%d",adv/100);
+               SetTextColor(hdc,RGB(200,220,130));SelectFont(hdc,hSF);
+               DrawTextW(hdc,ms,-1,&cr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);}
+     SelectFont(hdc,cf);}
     SelectFont(hdc,oldbf);
 
-    // Dividers
+    // Dividers (adjusted for captures)
     {HPEN lp=CreatePen(PS_SOLID,1,RGB(55,60,70));
      HGDIOBJ lop=SelectObject(hdc,lp);
-     MoveToEx(hdc,px,32,NULL);LineTo(hdc,WIN_W,32);
-     MoveToEx(hdc,px,WIN_H-34,NULL);LineTo(hdc,WIN_W,WIN_H-34);
+     MoveToEx(hdc,px,40,NULL);LineTo(hdc,WIN_W,40);
+     MoveToEx(hdc,px,WIN_H-46,NULL);LineTo(hdc,WIN_W,WIN_H-46);
      SelectObject(hdc,lop);DeleteObject(lp);}
+
+    // Eval bar (just below top divider)
+    {int ev=evalAbs(toBS());
+     int evCl=std::max(-600,std::min(600,ev));
+     int bL=px+6,bW=WIN_W-px-12,bY=44;
+     RECT bg2={bL,bY,bL+bW,bY+7};
+     HBRUSH bk2=CreateSolidBrush(RGB(22,22,28));FillRect(hdc,&bg2,bk2);DeleteObject(bk2);
+     int wPx=(evCl+600)*bW/1200;
+     RECT wb={bL+bW-wPx,bY,bL+bW,bY+7};
+     HBRUSH wbr=CreateSolidBrush(RGB(225,225,225));FillRect(hdc,&wb,wbr);DeleteObject(wbr);
+     {HPEN ep=CreatePen(PS_SOLID,1,RGB(55,60,70));
+      HGDIOBJ eop=SelectObject(hdc,ep);
+      HBRUSH en=(HBRUSH)GetStockObject(NULL_BRUSH);
+      HGDIOBJ eob=SelectObject(hdc,en);
+      Rectangle(hdc,bL,bY,bL+bW,bY+7);
+      SelectObject(hdc,eop);SelectObject(hdc,eob);DeleteObject(ep);}
+     int av2=abs(ev),wh=av2/100,tn=(av2%100)/10;
+     wchar_t es[16];
+     if(ev>20)       wsprintfW(es,L"+%d.%d",wh,tn);
+     else if(ev<-20) wsprintfW(es,L"-%d.%d",wh,tn);
+     else            wsprintfW(es,L"0.0");
+     RECT etr={bL,bY+8,bL+bW,bY+22};
+     HFONT ef=SelectFont(hdc,hSF);
+     SetTextColor(hdc,ev>20?RGB(220,220,100):ev<-20?RGB(150,200,255):RGB(110,115,125));
+     SetBkMode(hdc,TRANSPARENT);
+     DrawTextW(hdc,es,-1,&etr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+     SelectFont(hdc,ef);}
 
     // Move history (scrollable)
     {HFONT oldmf=SelectFont(hdc,hSF);
-     int visLines=(WIN_H-74)/18;
+     int histY0=68,histY1=WIN_H-50;
+     int visLines=(histY1-histY0)/18;
      int total=(int)G.hist.size()/2+(G.hist.size()%2?1:0);
      int off=std::max(0,std::min(G.histScroll,std::max(0,total-visLines)));
-     int hy=38;
-     for(int pair=off;pair<total&&hy<WIN_H-38;pair++){
+     int hy=histY0;
+     for(int pair=off;pair<total&&hy<histY1;pair++){
          int i=pair*2;
          std::string w2=G.hist[i],b2=(i+1<(int)G.hist.size())?G.hist[i+1]:"";
          wchar_t line[48]; wsprintfW(line,L"%2d. %-7hs%hs",pair+1,w2.c_str(),b2.c_str());
@@ -945,7 +1110,7 @@ static void render(HDC hdc){
      }
      if(total>visLines){
          SetTextColor(hdc,RGB(70,75,85));
-         RECT sr2={px+6,WIN_H-36,WIN_W-4,WIN_H-20};
+         RECT sr2={px+6,histY1,WIN_W-4,histY1+16};
          DrawTextW(hdc,L"↑↓ cuon lich su",-1,&sr2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
      SelectFont(hdc,oldmf);}
 
@@ -1162,14 +1327,15 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSEWHEEL:{
         int delta=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
-        int maxScroll=std::max(0,(int)G.hist.size()/2-13);
+        int maxScroll=std::max(0,(int)G.hist.size()/2-(WIN_H-118)/18);
         G.histScroll=std::max(0,std::min(maxScroll,G.histScroll-delta));
         InvalidateRect(hw,NULL,FALSE);break;
     }
     case WM_DESTROY:
-        aiCancelled=true;
+        aiCancelled.store(true);
+        if(aiThreadHandle!=NULL){WaitForSingleObject(aiThreadHandle,1500);CloseHandle(aiThreadHandle);aiThreadHandle=NULL;}
         KillTimer(hw,TIMER_ANIM);KillTimer(hw,TIMER_CLOCK);
-        DeleteObject(hPF);DeleteObject(hSF);DeleteObject(hBF);
+        DeleteObject(hPF);DeleteObject(hSF);DeleteObject(hBF);DeleteObject(hCF);
         for(int i=0;i<12;i++)if(pieceImgs[i])delete pieceImgs[i];
         Gdiplus::GdiplusShutdown(gdipToken);
         PostQuitMessage(0);return 0;
@@ -1189,6 +1355,8 @@ static void loadPieceImages(){
         pieceImgs[i]=new Gdiplus::Bitmap(names[i]);
         if(pieceImgs[i]->GetLastStatus()!=Gdiplus::Ok){
             hasPNG=false;delete pieceImgs[i];pieceImgs[i]=nullptr;}}
+    if(!hasPNG)
+        G.status="Khong tim thay anh PNG - dung ky tu Unicode thay the.";
 }
 
 static void initGame(){
@@ -1202,12 +1370,20 @@ static void initGame(){
     G.inCheck=G.gameOver=G.aiBusy=G.anim.active=G.drag.active=false;
     G.undoStack.clear();G.hist.clear();G.repStack.clear();G.histScroll=0;
     G.halfmoveClock=0;G.fullmoveNum=1;G.promoPickMode=false;
+    G.capturedByW.clear();G.capturedByB.clear();
     memset(killers,0xff,sizeof(killers));
     memset(ttable,0,sizeof(ttable));
 }
 
 static void startNewGame(){
-    if(G.aiBusy){aiCancelled=true;G.aiBusy=false;Sleep(50);}
+    if(G.aiBusy){
+        aiCancelled.store(true);
+        if(aiThreadHandle!=NULL){
+            WaitForSingleObject(aiThreadHandle,1000);
+            CloseHandle(aiThreadHandle);aiThreadHandle=NULL;
+        }
+        G.aiBusy=false;
+    }
     int r1=MessageBoxW(hWnd,L"Do kho:\nYes=De/TB  No=Kho/CG",L"Do kho",MB_YESNO);
     if(r1==IDYES){int r2=MessageBoxW(hWnd,L"Yes=De(2)  No=TB(3)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?2:3;}
     else         {int r2=MessageBoxW(hWnd,L"Yes=Kho(4)  No=CG(5)",L"Do kho",MB_YESNO);G.aiDepth=(r2==IDYES)?4:5;}
@@ -1259,6 +1435,8 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
                     CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Consolas");
     hBF=CreateFontW(15,0,0,0,FW_BOLD, 0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    hCF=CreateFontW(18,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI Symbol");
 
     SetTimer(hWnd,TIMER_CLOCK,100,NULL);
 
