@@ -34,8 +34,9 @@
 #pragma comment(lib,"comdlg32.lib")
 
 // ─────────────────── CONSTANTS ───────────────────────────────
-static const int SQ=80, OX=20, OY=20, SP=195, INF=30000;
-static const int WIN_W=OX+8*SQ+SP+8, WIN_H=OY+8*SQ+50;
+static const int OX=20, OY=20, SP=195, INF=30000;
+static int gSQ=80;
+static int gWW=OX+8*80+SP+8, gWH=OY+8*80+50;
 #define WM_AI_DONE  (WM_APP+1)
 #define TIMER_ANIM  1
 #define TIMER_CLOCK 2
@@ -134,12 +135,12 @@ inline bool isFriend(char p,bool w){ return w?isW(p):isB(p); }
 inline bool timeUp(){ return aiCancelled||(int)(GetTickCount()-aiStartTick)>=aiTimeLimitMs; }
 
 // POV-aware coordinate helpers (Black plays from bottom when !playerWhite)
-inline int bToSX(int c){ return OX+(G.playerWhite?c:7-c)*SQ+SQ/2; }
-inline int bToSY(int r){ return OY+(G.playerWhite?r:7-r)*SQ+SQ/2; }
-inline int sToR(int my){ int v=(my-OY)/SQ; return (v<0||v>7)?-1:(G.playerWhite?v:7-v); }
-inline int sToC(int mx){ int v=(mx-OX)/SQ; return (v<0||v>7)?-1:(G.playerWhite?v:7-v); }
-inline int sqLeft(int c){ return OX+(G.playerWhite?c:7-c)*SQ; }
-inline int sqTop (int r){ return OY+(G.playerWhite?r:7-r)*SQ; }
+inline int bToSX(int c){ return OX+(G.playerWhite?c:7-c)*gSQ+gSQ/2; }
+inline int bToSY(int r){ return OY+(G.playerWhite?r:7-r)*gSQ+gSQ/2; }
+inline int sToR(int my){ int v=(my-OY)/gSQ; return (v<0||v>7)?-1:(G.playerWhite?v:7-v); }
+inline int sToC(int mx){ int v=(mx-OX)/gSQ; return (v<0||v>7)?-1:(G.playerWhite?v:7-v); }
+inline int sqLeft(int c){ return OX+(G.playerWhite?c:7-c)*gSQ; }
+inline int sqTop (int r){ return OY+(G.playerWhite?r:7-r)*gSQ; }
 
 // ─────────────────── ZOBRIST ─────────────────────────────────
 static unsigned long long zrand(){
@@ -349,9 +350,9 @@ static void applyGlobal(const Move& m){
     // Hash uses side-to-move AFTER the move = !wasWhite
     G.repStack.push_back(zhash(toBS(),!wasWhite));
 
-    // Auto-scroll history to show latest moves (histY0=68, histY1=WIN_H-50)
+    // Auto-scroll history to show latest moves (histY0=68, histY1=gWH-50)
     int total=(int)G.hist.size()/2+((int)G.hist.size()%2?1:0);
-    int visLines=(WIN_H-118)/18;
+    int visLines=(gWH-118)/18;
     G.histScroll=std::max(0,total-visLines);
 }
 
@@ -885,7 +886,8 @@ static int pngIdx(char p){
     case 'b':return 9;case 'n':return 10;case 'p':return 11;}
     return -1;
 }
-static void drawPiece(HDC hdc,char p,int px,int py,int sz=SQ){
+static void drawPiece(HDC hdc,char p,int px,int py,int sz=0){
+    if(sz<=0) sz=gSQ;
     int idx=pngIdx(p);
     if(hasPNG&&idx>=0&&pieceImgs[idx]){
         Gdiplus::Graphics gfx(hdc);
@@ -939,7 +941,7 @@ static void render(HDC hdc){
         Gdiplus::REAL ih=(Gdiplus::REAL)bgKnight->GetHeight();
         gfx.DrawImage(bgKnight,
             Gdiplus::RectF((Gdiplus::REAL)OX,(Gdiplus::REAL)OY,
-                           (Gdiplus::REAL)(8*SQ),(Gdiplus::REAL)(8*SQ)),
+                           (Gdiplus::REAL)(8*gSQ),(Gdiplus::REAL)(8*gSQ)),
             0,0,iw,ih,Gdiplus::UnitPixel,&ia);
     }
 
@@ -952,17 +954,17 @@ static void render(HDC hdc){
         if(G.drag.active&&r==G.drag.srcR&&c==G.drag.srcC) col=C_SEL;
         if(r==ckR&&c==ckC) col=C_CHK;
         int sx=sqLeft(c),sy=sqTop(r);
-        RECT sq={sx,sy,sx+SQ,sy+SQ};
+        RECT sq={sx,sy,sx+gSQ,sy+gSQ};
         HBRUSH br=CreateSolidBrush(col);FillRect(hdc,&sq,br);DeleteObject(br);
         // Legal move indicators
         for(auto& mv:G.legal){
             if(mv.tr!=r||mv.tc!=c)continue;
-            int cx=sx+SQ/2, cy=sy+SQ/2;
+            int cx=sx+gSQ/2, cy=sy+gSQ/2;
             if(G.board[r][c]!='.'){
                 HPEN  pen=CreatePen(PS_SOLID,6,lt?RGB(90,110,55):RGB(80,100,45));
                 HBRUSH nb=(HBRUSH)GetStockObject(NULL_BRUSH);
                 HGDIOBJ op=SelectObject(hdc,pen), ob=SelectObject(hdc,nb);
-                Ellipse(hdc,sx+5,sy+5,sx+SQ-5,sy+SQ-5);
+                Ellipse(hdc,sx+5,sy+5,sx+gSQ-5,sy+gSQ-5);
                 SelectObject(hdc,op); SelectObject(hdc,ob);
                 DeleteObject(pen);
             }else{
@@ -985,12 +987,12 @@ static void render(HDC hdc){
         // Rank label: col=0, so square color = (boardR+0)%2. Light sq → dark label.
         bool rankSqLight=(boardR%2==0);
         SetTextColor(hdc,rankSqLight?C_DARK:C_LIGHT);
-        RECT rr={OX+3,OY+i*SQ+3,OX+18,OY+i*SQ+19};
+        RECT rr={OX+3,OY+i*gSQ+3,OX+18,OY+i*gSQ+19};
         wchar_t nb[4]; wsprintfW(nb,L"%d",8-boardR);
         DrawTextW(hdc,nb,-1,&rr,DT_LEFT|DT_TOP);
         // File label: at bottom of board. Square color at screen col i = (7+i)%2 = (7-i)%2.
         SetTextColor(hdc,((7-i)%2==0)?C_DARK:C_LIGHT);
-        RECT fr2={OX+i*SQ+SQ-17,OY+8*SQ-18,OX+i*SQ+SQ-2,OY+8*SQ-3};
+        RECT fr2={OX+i*gSQ+gSQ-17,OY+8*gSQ-18,OX+i*gSQ+gSQ-2,OY+8*gSQ-3};
         wchar_t fc[4]={(wchar_t)('a'+boardC),0};
         DrawTextW(hdc,fc,-1,&fr2,DT_RIGHT|DT_BOTTOM);
     }
@@ -1023,15 +1025,15 @@ static void render(HDC hdc){
         drawPiece(hdc,p,bToSX(c),bToSY(r));
     }
     if(G.anim.active) drawPiece(hdc,G.anim.piece,(int)G.anim.cx,(int)G.anim.cy);
-    if(G.drag.active) drawPiece(hdc,G.drag.piece,G.drag.cx,G.drag.cy,SQ+10);
+    if(G.drag.active) drawPiece(hdc,G.drag.piece,G.drag.cx,G.drag.cy,gSQ+10);
 
     // ── Side panel ──
-    int px=OX+8*SQ+8;
-    {RECT panel={px-2,0,WIN_W,WIN_H};
+    int px=OX+8*gSQ+8;
+    {RECT panel={px-2,0,gWW,gWH};
      HBRUSH pb=CreateSolidBrush(C_PANEL);FillRect(hdc,&panel,pb);DeleteObject(pb);}
     {HPEN dp=CreatePen(PS_SOLID,1,RGB(55,60,70));
      HGDIOBJ dop=SelectObject(hdc,dp);
-     MoveToEx(hdc,px-2,0,NULL);LineTo(hdc,px-2,WIN_H);
+     MoveToEx(hdc,px-2,0,NULL);LineTo(hdc,px-2,gWH);
      SelectObject(hdc,dop);DeleteObject(dp);}
     SetBkMode(hdc,TRANSPARENT);
 
@@ -1053,7 +1055,7 @@ static void render(HDC hdc){
     // Opponent (AI) clock + captures
     {std::string s=G.playerWhite?"Black (AI)":"White (AI)";
      std::wstring sw(s.begin(),s.end());
-     RECT lbl={px+6,4,WIN_W-6,22};
+     RECT lbl={px+6,4,gWW-6,22};
      SetTextColor(hdc,C_TEXT);
      DrawTextW(hdc,sw.c_str(),-1,&lbl,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
      SetTextColor(hdc,G.aiBusy?RGB(250,200,80):C_TEXT);
@@ -1061,7 +1063,7 @@ static void render(HDC hdc){
     {std::wstring glyphs; int adv;
      matInfo(aiIsWhite,glyphs,adv);
      HFONT cf=SelectFont(hdc,hCF);
-     RECT cr={px+6,22,WIN_W-6,38};
+     RECT cr={px+6,22,gWW-6,38};
      SetTextColor(hdc,RGB(130,135,145));
      if(!glyphs.empty()) DrawTextW(hdc,glyphs.c_str(),-1,&cr,DT_LEFT|DT_TOP);
      if(adv>0){wchar_t ms[8];wsprintfW(ms,L"+%d",adv/100);
@@ -1071,7 +1073,7 @@ static void render(HDC hdc){
     // Player clock + captures
     {std::string s=G.playerWhite?"White (You)":"Black (You)";
      std::wstring sw(s.begin(),s.end());
-     RECT lbl={px+6,WIN_H-30,WIN_W-6,WIN_H-12};
+     RECT lbl={px+6,gWH-30,gWW-6,gWH-12};
      SetTextColor(hdc,C_TEXT);
      DrawTextW(hdc,sw.c_str(),-1,&lbl,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
      SetTextColor(hdc,G.playerTurn?RGB(250,200,80):C_TEXT);
@@ -1079,7 +1081,7 @@ static void render(HDC hdc){
     {std::wstring glyphs; int adv;
      matInfo(!aiIsWhite,glyphs,adv);
      HFONT cf=SelectFont(hdc,hCF);
-     RECT cr={px+6,WIN_H-44,WIN_W-6,WIN_H-30};
+     RECT cr={px+6,gWH-44,gWW-6,gWH-30};
      SetTextColor(hdc,RGB(130,135,145));
      if(!glyphs.empty()) DrawTextW(hdc,glyphs.c_str(),-1,&cr,DT_LEFT|DT_TOP);
      if(adv>0){wchar_t ms[8];wsprintfW(ms,L"+%d",adv/100);
@@ -1091,14 +1093,14 @@ static void render(HDC hdc){
     // Dividers (adjusted for captures)
     {HPEN lp=CreatePen(PS_SOLID,1,RGB(55,60,70));
      HGDIOBJ lop=SelectObject(hdc,lp);
-     MoveToEx(hdc,px,40,NULL);LineTo(hdc,WIN_W,40);
-     MoveToEx(hdc,px,WIN_H-46,NULL);LineTo(hdc,WIN_W,WIN_H-46);
+     MoveToEx(hdc,px,40,NULL);LineTo(hdc,gWW,40);
+     MoveToEx(hdc,px,gWH-46,NULL);LineTo(hdc,gWW,gWH-46);
      SelectObject(hdc,lop);DeleteObject(lp);}
 
     // Eval bar (just below top divider)
     {int ev=evalAbs(toBS());
      int evCl=std::max(-600,std::min(600,ev));
-     int bL=px+6,bW=WIN_W-px-12,bY=44;
+     int bL=px+6,bW=gWW-px-12,bY=44;
      RECT bg2={bL,bY,bL+bW,bY+7};
      HBRUSH bk2=CreateSolidBrush(RGB(22,22,28));FillRect(hdc,&bg2,bk2);DeleteObject(bk2);
      int wPx=(evCl+600)*bW/1200;
@@ -1124,7 +1126,7 @@ static void render(HDC hdc){
 
     // Move history (scrollable)
     {HFONT oldmf=SelectFont(hdc,hSF);
-     int histY0=68,histY1=WIN_H-50;
+     int histY0=68,histY1=gWH-50;
      int visLines=(histY1-histY0)/18;
      int total=(int)G.hist.size()/2+(G.hist.size()%2?1:0);
      int off=std::max(0,std::min(G.histScroll,std::max(0,total-visLines)));
@@ -1134,18 +1136,18 @@ static void render(HDC hdc){
          std::string w2=G.hist[i],b2=(i+1<(int)G.hist.size())?G.hist[i+1]:"";
          wchar_t line[48]; wsprintfW(line,L"%2d. %-7hs%hs",pair+1,w2.c_str(),b2.c_str());
          SetTextColor(hdc,(pair==total-1)?RGB(230,230,180):RGB(150,155,160));
-         RECT lr={px+6,hy,WIN_W-4,hy+18};
+         RECT lr={px+6,hy,gWW-4,hy+18};
          DrawTextW(hdc,line,-1,&lr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
          hy+=18;
      }
      if(total>visLines){
          SetTextColor(hdc,RGB(70,75,85));
-         RECT sr2={px+6,histY1,WIN_W-4,histY1+16};
+         RECT sr2={px+6,histY1,gWW-4,histY1+16};
          DrawTextW(hdc,L"↑↓ cuon lich su",-1,&sr2,DT_CENTER|DT_VCENTER|DT_SINGLELINE);}
      SelectFont(hdc,oldmf);}
 
     // Status bar
-    {RECT sr={0,OY+8*SQ+2,OX+8*SQ,WIN_H};
+    {RECT sr={0,OY+8*gSQ+2,OX+8*gSQ,gWH};
      HBRUSH sb=CreateSolidBrush(C_BG);FillRect(hdc,&sr,sb);DeleteObject(sb);
      HFONT oldsf=SelectFont(hdc,hBF);
      SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(220,220,100));
@@ -1154,7 +1156,7 @@ static void render(HDC hdc){
      SelectFont(hdc,oldsf);}
 
     // Hint bar
-    {RECT hr={OX+8*SQ+2,OY+8*SQ+2,WIN_W,WIN_H};
+    {RECT hr={OX+8*gSQ+2,OY+8*gSQ+2,gWW,gWH};
      HFONT oldh=SelectFont(hdc,hSF);
      SetTextColor(hdc,RGB(90,95,105));SetBkMode(hdc,TRANSPARENT);
      DrawTextW(hdc,L"^Z Undo  ^N New  ^F FEN  ^S PGN",-1,&hr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -1164,23 +1166,23 @@ static void render(HDC hdc){
     if(G.promoPickMode){
         const char promos[]={'q','r','b','n'};
         int sx=sqLeft(G.promoTC);
-        int startSR=(sqTop(G.promoTR)-OY)/SQ; // = 0 (promotion square is always at top from player POV)
+        int startSR=(sqTop(G.promoTR)-OY)/gSQ; // = 0 (promotion square is always at top from player POV)
         for(int i=0;i<4;i++){
-            int sy=OY+(startSR+i)*SQ;
-            RECT sq2={sx,sy,sx+SQ,sy+SQ};
+            int sy=OY+(startSR+i)*gSQ;
+            RECT sq2={sx,sy,sx+gSQ,sy+gSQ};
             HBRUSH sqb=CreateSolidBrush(RGB(50,55,65));FillRect(hdc,&sq2,sqb);DeleteObject(sqb);
             HPEN hp=CreatePen(PS_SOLID,3,RGB(220,200,60));
             HGDIOBJ hop=SelectObject(hdc,hp);
             HBRUSH nb2=(HBRUSH)GetStockObject(NULL_BRUSH);
             HGDIOBJ hob=SelectObject(hdc,nb2);
-            Rectangle(hdc,sx+2,sy+2,sx+SQ-2,sy+SQ-2);
+            Rectangle(hdc,sx+2,sy+2,sx+gSQ-2,sy+gSQ-2);
             SelectObject(hdc,hop);SelectObject(hdc,hob);DeleteObject(hp);
             char piece=G.playerWhite?(char)toupper(promos[i]):promos[i];
-            drawPiece(hdc,piece,sx+SQ/2,sy+SQ/2);
+            drawPiece(hdc,piece,sx+gSQ/2,sy+gSQ/2);
         }
         SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,RGB(255,255,100));
         HFONT olf=SelectFont(hdc,hBF);
-        RECT lr={OX,OY+8*SQ-20,OX+8*SQ,OY+8*SQ};
+        RECT lr={OX,OY+8*gSQ-20,OX+8*gSQ,OY+8*gSQ};
         DrawTextW(hdc,L"Click de chon quan phong cap",-1,&lr,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         SelectFont(hdc,olf);
     }
@@ -1229,6 +1231,25 @@ static void startNewGame(); // forward
 
 static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
+    case WM_GETMINMAXINFO:{
+        MINMAXINFO* mm=(MINMAXINFO*)lp;
+        // Minimum window size: SQ=40, plus borders/title bar
+        mm->ptMinTrackSize.x=OX+8*40+SP+8+16;
+        mm->ptMinTrackSize.y=OY+8*40+50+39;
+        return 0;
+    }
+    case WM_SIZE:{
+        int cw=LOWORD(lp), ch=HIWORD(lp);
+        if(cw>0&&ch>0){
+            int sqByH=(ch-OY-50)/8;
+            int sqByW=(cw-OX-SP-8)/8;
+            int ns=sqByH<sqByW?sqByH:sqByW;
+            if(ns<40) ns=40; if(ns>150) ns=150;
+            gSQ=ns; gWW=cw; gWH=ch;
+            InvalidateRect(hw,NULL,FALSE);
+        }
+        return 0;
+    }
     case WM_PAINT:{
         PAINTSTRUCT ps; HDC hdc=BeginPaint(hw,&ps);
         RECT rc; GetClientRect(hw,&rc);
@@ -1270,10 +1291,10 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         // Handle inline promotion picker
         if(G.promoPickMode){
             int sx=sqLeft(G.promoTC);
-            int startSR=(sqTop(G.promoTR)-OY)/SQ;
+            int startSR=(sqTop(G.promoTR)-OY)/gSQ;
             const char promos[]={'q','r','b','n'};
-            if(mx>=sx&&mx<sx+SQ){
-                int pick=(my-OY)/SQ - startSR;
+            if(mx>=sx&&mx<sx+gSQ){
+                int pick=(my-OY)/gSQ - startSR;
                 if(pick>=0&&pick<4){
                     char chosen=promos[pick];
                     G.promoPickMode=false;
@@ -1357,7 +1378,7 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_MOUSEWHEEL:{
         int delta=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
-        int maxScroll=std::max(0,(int)G.hist.size()/2-(WIN_H-118)/18);
+        int maxScroll=std::max(0,(int)G.hist.size()/2-(gWH-118)/18);
         G.histScroll=std::max(0,std::min(maxScroll,G.histScroll-delta));
         InvalidateRect(hw,NULL,FALSE);break;
     }
@@ -1469,8 +1490,8 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int nShow){
 
     hWnd=CreateWindowW(L"ChessApp",
         L"Co Vua  •  Ctrl+Z Undo  Ctrl+N New  Ctrl+F FEN  Ctrl+S PGN",
-        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
-        CW_USEDEFAULT,CW_USEDEFAULT,WIN_W+16,WIN_H+39,NULL,NULL,hInst,NULL);
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,CW_USEDEFAULT,gWW+16,gWH+39,NULL,NULL,hInst,NULL);
 
     hPF=CreateFontW(56,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI Symbol");
