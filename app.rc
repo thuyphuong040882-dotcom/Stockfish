@@ -1,6 +1,6 @@
-// Windows resource file — embeds icon.ico into chess.exe
+// Windows resource file — embeds Knight.ico into chess.exe
 // Compile: windres app.rc -o app_res.o
 // Then link:  g++ finalcode.cpp app_res.o -o chess.exe ...
 #include <windows.h>
 
-IDI_ICON1  ICON  "icon.ico"
+IDI_ICON1  ICON  "Knight.ico"
